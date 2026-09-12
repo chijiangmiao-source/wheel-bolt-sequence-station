@@ -7,6 +7,8 @@ import {
   TORQUE_MIN,
   TORQUE_MAX,
   IDEMPOTENCY_KEY_MAX_LENGTH,
+  CANCEL_REASON_MIN_LENGTH,
+  CANCEL_REASON_MAX_LENGTH,
 } from './constants.js';
 
 const UUID_RE =
@@ -36,13 +38,19 @@ function confirmationView(row) {
 
 /** 由会话行推导的权威进度。 */
 function progressOf(session) {
-  const completed = session.status === 'completed';
-  return {
+  const finished = session.status !== 'in_progress';
+  const progress = {
     status: session.status,
     confirmed_count: session.expected_sequence - 1,
-    expected_sequence: completed ? null : session.expected_sequence,
-    expected_position: completed ? null : POSITIONS[session.expected_sequence - 1],
+    expected_sequence: finished ? null : session.expected_sequence,
+    expected_position: finished ? null : POSITIONS[session.expected_sequence - 1],
   };
+  // 终止信息仅在已终止会话上出现，进行中/已完成响应保持原格式不变
+  if (session.status === 'cancelled') {
+    progress.cancel_reason = session.cancel_reason;
+    progress.cancelled_at = session.cancelled_at;
+  }
+  return progress;
 }
 
 function sessionView(session, confirmations) {
@@ -112,6 +120,71 @@ export function createApp() {
     }
   });
 
+  // 带原因终止复核（拆下返修/装夹错误）。在会话行锁事务内把进行中会话转为已终止；
+  // 重复终止幂等返回现有结果；已完成会话不可终止。终止与确认并发时先取得行锁者生效。
+  app.post('/api/sessions/:id/cancel', async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      const { id } = req.params;
+      if (!UUID_RE.test(id)) {
+        throw new ApiError(404, 'session_not_found', '会话不存在');
+      }
+      const reason = (req.body ?? {}).reason;
+      // 按字符（Unicode 码点）计数，与数据库 char_length 一致
+      const reasonLength = typeof reason === 'string' ? [...reason.trim()].length : 0;
+      if (
+        typeof reason !== 'string' ||
+        reasonLength < CANCEL_REASON_MIN_LENGTH ||
+        reasonLength > CANCEL_REASON_MAX_LENGTH
+      ) {
+        throw new ApiError(
+          400,
+          'invalid_body',
+          `终止原因必须为 ${CANCEL_REASON_MIN_LENGTH}–${CANCEL_REASON_MAX_LENGTH} 字的字符串`,
+        );
+      }
+
+      await client.query('BEGIN');
+      const sres = await client.query(
+        'SELECT * FROM sessions WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      if (sres.rowCount === 0) {
+        throw new ApiError(404, 'session_not_found', '会话不存在');
+      }
+      const session = sres.rows[0];
+
+      // 重复终止：不改动任何数据，返回现有终止结果（幂等）
+      if (session.status === 'cancelled') {
+        await client.query('COMMIT');
+        return res.json({ cancelled: true, replayed: true, progress: progressOf(session) });
+      }
+      // 已完成会话不可终止
+      if (session.status === 'completed') {
+        throw new ApiError(
+          409,
+          'session_completed',
+          '会话已完成，不可终止',
+          { progress: progressOf(session) },
+        );
+      }
+
+      const upd = await client.query(
+        `UPDATE sessions
+         SET status = 'cancelled', cancel_reason = $1, cancelled_at = now(), updated_at = now()
+         WHERE id = $2 RETURNING *`,
+        [reason.trim(), id],
+      );
+      await client.query('COMMIT');
+      res.json({ cancelled: true, replayed: false, progress: progressOf(upd.rows[0]) });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      next(err);
+    } finally {
+      client.release();
+    }
+  });
+
   // 提交一次复核确认。校验顺序：幂等 → 序号（迟到/越序）→ 位置 → 扭矩。
   // 任何失败都不推进进度、不消耗幂等键。
   app.post('/api/sessions/:id/confirmations', async (req, res, next) => {
@@ -163,6 +236,17 @@ export function createApp() {
       }
       const session = sres.rows[0];
       const progress = progressOf(session);
+
+      // 会话已终止：任何提交（含旧客户端迟到的自动重试）一律拒绝且不写事件，
+      // 并随错误返回最新权威进度。须在幂等查询之前判定。
+      if (session.status === 'cancelled') {
+        throw new ApiError(
+          409,
+          'session_cancelled',
+          '会话已终止复核，不再接受确认提交',
+          { progress },
+        );
+      }
 
       // 1) 幂等键优先：已落库的确认事件决定重试语义
       const eres = await client.query(

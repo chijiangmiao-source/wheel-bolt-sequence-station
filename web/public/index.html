@@ -33,10 +33,33 @@
              inputmode="numeric" autocomplete="off" placeholder="例如 4500">
     </label>
     <button id="btn-submit" type="button">确认复核</button>
+    <button id="btn-cancel-open" class="btn-danger-outline" type="button">终止复核</button>
+  </section>
+
+  <section id="cancel-panel" class="cancel-panel" hidden>
+    <h2>终止复核</h2>
+    <p class="hint">终止后该会话不可再提交扭矩确认，请填写原因（2–100 字），例如「轮毂拆下返修」「装夹错误」。</p>
+    <label class="field">
+      终止原因
+      <textarea id="cancel-reason" rows="3" maxlength="100"
+                placeholder="请说明终止原因（2–100 字）"></textarea>
+    </label>
+    <p id="cancel-reason-hint" class="hint"></p>
+    <div class="cancel-actions">
+      <button id="btn-cancel-confirm" class="btn-danger" type="button">确认终止</button>
+      <button id="btn-cancel-back" type="button">返回继续复核</button>
+    </div>
   </section>
 
   <p id="notice" class="notice" role="status"></p>
   <p id="error" class="error" role="alert"></p>
+
+  <section id="cancelled-banner" class="cancelled" hidden>
+    <h2>该会话已终止复核</h2>
+    <p>终止时间：<strong id="cancelled-at"></strong></p>
+    <p>终止原因：<strong id="cancelled-reason"></strong></p>
+    <p class="hint">扭矩提交已关闭，如需继续请点击「开始新会话」。</p>
+  </section>
 
   <section id="done-banner" class="done" hidden>
     <h2>轮毂复核完成</h2>

@@ -3,13 +3,24 @@
 
 CREATE TABLE sessions (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- in_progress 进行中；completed 六步全部完成；cancelled 操作工带原因终止（拆下返修/装夹错误）
   status            TEXT NOT NULL DEFAULT 'in_progress'
-                    CHECK (status IN ('in_progress', 'completed')),
+                    CHECK (status IN ('in_progress', 'completed', 'cancelled')),
   -- 下一个期待的序号（从 1 开始）；六步全部确认后为 7，仅服务端可推进
   expected_sequence INTEGER NOT NULL DEFAULT 1
                     CHECK (expected_sequence BETWEEN 1 AND 7),
+  -- 终止原因与终止时间：仅 status = 'cancelled' 时非空，长度 2–100 字
+  cancel_reason     TEXT,
+  cancelled_at      TIMESTAMPTZ,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (
+    (status = 'cancelled'
+      AND char_length(cancel_reason) BETWEEN 2 AND 100
+      AND cancelled_at IS NOT NULL)
+    OR
+    (status <> 'cancelled' AND cancel_reason IS NULL AND cancelled_at IS NULL)
+  )
 );
 
 CREATE TABLE confirmations (

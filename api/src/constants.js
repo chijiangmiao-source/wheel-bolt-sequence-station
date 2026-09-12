@@ -7,3 +7,7 @@ export const TORQUE_MIN = 4200;
 export const TORQUE_MAX = 4800;
 
 export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+
+// 终止复核原因长度（按字符计），2–100 字
+export const CANCEL_REASON_MIN_LENGTH = 2;
+export const CANCEL_REASON_MAX_LENGTH = 100;

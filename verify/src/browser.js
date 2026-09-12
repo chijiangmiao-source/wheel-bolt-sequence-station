@@ -152,6 +152,114 @@ export async function runBrowser(webBase, apiBase, t) {
       assert(await page.isHidden('#work-panel'), '完成后不应再显示提交表单');
       await page.close();
     });
+
+    await t.test('完成两步后页面终止复核：展示原因与时间、关闭扭矩提交、刷新后保持', async () => {
+      const page = await newSessionPage();
+      await confirmCurrent(page, 4500);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      await confirmCurrent(page, 4600);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+
+      // 打开终止面板；少于 2 字应被页面拦下，不发请求也不离开当前步
+      await page.click('#btn-cancel-open');
+      await page.waitForSelector('#cancel-panel:not([hidden])');
+      await page.fill('#cancel-reason', '返');
+      await page.click('#btn-cancel-confirm');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('2–100'));
+      assert(await page.isVisible('#cancel-panel'), '原因过短时留在终止面板');
+
+      // 填写合规原因并确认
+      const reason = '装夹错误，拆下返修';
+      await page.fill('#cancel-reason', reason);
+      await page.click('#btn-cancel-confirm');
+      await page.waitForSelector('#cancelled-banner:not([hidden])');
+      const banner = await page.textContent('#cancelled-banner');
+      assert(banner.includes(reason), '横幅应展示终止原因');
+      assert(/\d{4}\/\d{1,2}\/\d{1,2}/.test(banner), '横幅应展示终止时间');
+      assert(await page.isHidden('#work-panel'), '扭矩提交面板应关闭');
+      assert(await page.isHidden('#btn-submit'), '确认按钮不可用');
+      assert(await page.isHidden('#cancel-panel'), '终止填写面板应关闭');
+
+      // 已确认的两步仍标记完成
+      assertEqual(await page.locator('#bolt-list li.done').count(), 2, '已完成的两步仍保留');
+
+      // 刷新后原因与终止态保持
+      await page.reload();
+      await page.waitForSelector('#cancelled-banner:not([hidden])');
+      const banner2 = await page.textContent('#cancelled-banner');
+      assert(banner2.includes(reason), '刷新后原因保持');
+      assert(await page.isHidden('#work-panel'), '刷新后扭矩提交仍关闭');
+
+      // 终止后再提交确认不推进（直连 API 验证页面所见即服务端权威态）
+      const sid = await page.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      const blocked = await fetch(`${apiBase}/api/sessions/${sid}/confirmations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sid,
+          sequence: 3,
+          position: 'A3',
+          torque: 4500,
+          idempotency_key: `browser-after-cancel-${Date.now()}`,
+        }),
+      });
+      assertEqual(blocked.status, 409, '终止后确认应被拒绝');
+      assertEqual((await blocked.json()).error.code, 'session_cancelled', '错误码为 session_cancelled');
+      const st = await serverState(page);
+      assertEqual(st.status, 'cancelled', '服务端保持已终止');
+      assertEqual(st.confirmations.length, 2, '确认不推进、不写事件');
+      await page.close();
+    });
+
+    await t.test('旧客户端只使用原三个接口：新建会话后按原六步完成', async () => {
+      // 模拟没有终止功能的旧客户端：只用 POST /sessions、GET /sessions/:id、
+      // POST /confirmations，且按原载荷/原字段解析响应，全程不调用 /cancel。
+      const page = await browser.newPage();
+      page.setDefaultTimeout(20000);
+      await page.goto(`${webBase}/`);
+      const result = await page.evaluate(async (positions) => {
+        const out = { steps: [] };
+        const created = await fetch('/api/sessions', { method: 'POST' });
+        if (created.status !== 201) { out.error = `create ${created.status}`; return out; }
+        const s = await created.json();
+        out.initialSeq = s.expected_sequence;
+        out.initialPos = s.expected_position;
+        for (let i = 0; i < 6; i += 1) {
+          const r = await fetch(`/api/sessions/${s.session_id}/confirmations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session_id: s.session_id,
+              sequence: i + 1,
+              position: positions[i],
+              torque: 4500,
+              idempotency_key: `legacy-${i}-${Date.now()}-${Math.random()}`,
+            }),
+          });
+          const body = await r.json();
+          out.steps.push({ status: r.status, replayed: body.replayed, seq: body.confirmation?.sequence });
+          if (r.status !== 201 || body.replayed !== false) { out.error = `step ${i + 1} bad`; return out; }
+        }
+        const final = await fetch(`/api/sessions/${s.session_id}`);
+        out.finalStatus = final.status;
+        const fj = await final.json();
+        out.status = fj.status;
+        out.events = fj.confirmations.length;
+        return out;
+      }, POSITIONS);
+      assertEqual(result.error, undefined, `旧客户端流程不应出错：${result.error ?? ''}`);
+      assertEqual(result.initialSeq, 1, '初始期待序号仍为 1');
+      assertEqual(result.initialPos, 'A1', '初始期待位置仍为 A1');
+      assertEqual(result.steps.length, 6, '六步均提交');
+      assertEqual(result.finalStatus, 200, '查询接口仍为 200');
+      assertEqual(result.status, 'completed', '旧客户端可正常完成六步');
+      assertEqual(result.events, 6, '六条确认事件');
+      await page.close();
+    });
   } finally {
     await browser.close();
   }

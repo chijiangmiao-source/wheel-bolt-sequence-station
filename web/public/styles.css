@@ -75,6 +75,45 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 }
 #btn-submit:hover:not(:disabled) { background: #0a4f92; }
 
+#btn-cancel-open {
+  margin-left: 10px;
+  color: var(--err);
+  border-color: var(--err);
+  background: #fff;
+}
+#btn-cancel-open:hover:not(:disabled) { background: var(--err-bg); }
+
+.btn-danger {
+  background: var(--err);
+  border-color: var(--err);
+  color: #fff;
+}
+.btn-danger:hover:not(:disabled) { background: #92201a; }
+
+.cancel-panel {
+  margin-top: 14px;
+  padding: 16px 20px;
+  border: 1px solid var(--err);
+  border-radius: 8px;
+  background: var(--err-bg);
+}
+
+.cancel-panel h2 { margin: 0 0 8px; font-size: 18px; color: var(--err); }
+.cancel-actions { display: flex; gap: 10px; }
+
+.field textarea {
+  display: block;
+  margin-top: 6px;
+  font: inherit;
+  font-size: 16px;
+  padding: 10px 12px;
+  width: 100%;
+  max-width: 480px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  resize: vertical;
+}
+
 .hint { color: var(--muted); }
 
 .bolts {
@@ -149,6 +188,17 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 }
 
 .done h2 { margin: 0 0 12px; color: var(--ok); font-size: 20px; }
+
+.cancelled {
+  margin-top: 18px;
+  padding: 16px 20px;
+  border: 1px solid var(--err);
+  border-radius: 8px;
+  background: var(--err-bg);
+}
+
+.cancelled h2 { margin: 0 0 12px; color: var(--err); font-size: 20px; }
+.cancelled p { margin: 6px 0; }
 
 #confirm-table {
   width: 100%;

@@ -46,8 +46,8 @@ docker compose run --rm verify
 
 验收覆盖：
 
-- **协议用例**（直连 API）：固定顺序与边界扭矩（4200/4800 含边界合格）、同键同载荷重放、同键不同载荷 409、迟到 409、越序 409、位置不符 422、扭矩越界/非整数拒绝、未知会话 404、缺字段/会话编号不一致 400、并发同键只落库一次、确认事件在数据库层不可 UPDATE/DELETE；
-- **页面用例**（真实 Chromium 驱动页面）：六步完成并显示「轮毂复核完成」、越界扭矩被拒绝且停留在当前螺栓、刷新后从服务端恢复权威进度、网络中断时页面以同一幂等键自动重试且服务端不重复记录、慢响应下触屏连点只记录一次、完成后刷新仍保持完成态。
+- **协议用例**（直连 API）：固定顺序与边界扭矩（4200/4800 含边界合格）、同键同载荷重放、同键不同载荷 409、迟到 409、越序 409、位置不符 422、扭矩越界/非整数拒绝、未知会话 404、缺字段/会话编号不一致 400、并发同键只落库一次、确认事件在数据库层不可 UPDATE/DELETE、完成两步后终止且刷新后保持原因与时间、终止后确认返回 409 `session_cancelled` 且不写事件、重复终止幂等返回现有结果、已完成会话不可终止、原因长度边界（2/100 字）、最后一步确认与终止并发只形成一个终态；
+- **页面用例**（真实 Chromium 驱动页面）：六步完成并显示「轮毂复核完成」、越界扭矩被拒绝且停留在当前螺栓、刷新后从服务端恢复权威进度、网络中断时页面以同一幂等键自动重试且服务端不重复记录、慢响应下触屏连点只记录一次、完成后刷新仍保持完成态、完成两步后页面终止并在刷新后保持原因与时间（扭矩提交关闭、终止后确认不推进）、旧客户端仅用原三个接口按原六步完成。
 
 ## API 协议
 
@@ -56,6 +56,7 @@ docker compose run --rm verify
 | POST | `/api/sessions` | 开始新会话（固定顺序 A1→B2→A3→B1→A2→B3），返回 `201` 与初始进度 |
 | GET | `/api/sessions/{id}` | 读取权威进度（页面刷新后以此为准） |
 | POST | `/api/sessions/{id}/confirmations` | 提交一次复核确认 |
+| POST | `/api/sessions/{id}/cancel` | 带原因终止复核（拆下返修/装夹错误），幂等可重放 |
 | GET | `/healthz` | 健康检查 |
 
 确认请求体：
@@ -89,16 +90,32 @@ docker compose run --rm verify
 
 并发与一致性：同一会话的提交在事务内以 `SELECT ... FOR UPDATE` 行锁串行化；`(session_id, sequence)` 与 `(session_id, idempotency_key)` 唯一约束兜底，因此并发重试/触屏连点最多落库一条确认。确认事件表由触发器禁止 `UPDATE/DELETE`，是只增不改的事件日志。
 
+### 终止复核（POST /cancel）
+
+轮毂拆下返修或装夹错误时，操作工可在未完成页面点击「终止复核」，填写 **2–100 字**原因后确认：
+
+- 请求体：`{ "reason": "轮毂拆下返修" }`；成功：`200 { cancelled: true, replayed: false, progress }`，`progress.status = 'cancelled'` 并携带 `cancel_reason`、`cancelled_at`、`confirmed_count`，`expected_sequence/expected_position` 为 `null`；
+- **已完成会话不可终止**：`409 session_completed`，返回完成态 `progress`；
+- **重复终止幂等**：已终止会话再次终止返回现有结果 `200 { cancelled: true, replayed: true, progress }`，原因与终止时间不被覆盖；
+- 原因缺失/非字符串/长度越界：`400 invalid_body`；未知会话：`404 session_not_found`。
+
+终止与确认并发：两者都在**会话行锁事务**内执行，先取得锁者生效，后到者在同一把锁上读到最新权威状态——确认先到则会话完成、终止收到 `409 session_completed`；终止先到则最后一步确认收到 `409 session_cancelled`。因此一个会话只会形成**一个终态**，确认事件始终只增不改（终止不删除、不改写任何事件）。
+
+已终止会话的任何确认提交（包括旧客户端在途的自动重试）一律返回 `409 session_cancelled` 与最新权威 `progress`，**不写事件、不推进、不消耗幂等键**；该判定在幂等键查询之前。
+
+`GET /api/sessions/{id}` 在已终止会话上额外返回 `cancel_reason`、`cancelled_at`；其余字段与原格式一致，旧客户端的创建、查询、确认请求不受影响。
+
 页面侧约定：
 
 - 每次「用户提交意图」生成一个幂等键；**网络异常（超时/断连）的自动重试复用同一键**（指数退避，最多 6 次），因此重试永远不会把同一颗螺栓记两次；
 - 收到确定性拒绝（4xx）不重试，展示拒绝原因并重新拉取权威进度对齐页面；
 - 提交在途时禁用提交按钮，避免触屏连点产生并发提交；
 - 刷新页面后重新 `GET` 权威进度；「轮毂复核完成」只在服务端状态为 `completed`（即六次有效确认全部落库）时显示，否则稳定停留在当前螺栓。
+- 「终止复核」仅在进行中会话可用：填写 2–100 字原因并确认后，页面展示终止时间与原因并关闭扭矩提交；刷新后从服务端恢复已终止态；旧页面不调用 `/cancel` 也不受任何影响。
 
 ## 数据模型
 
-- `sessions(id, status, expected_sequence, created_at, updated_at)`：`expected_sequence` 单调递增（1→7），只在有效确认落库的同一事务中推进；
+- `sessions(id, status, expected_sequence, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调递增（1→7），只在有效确认落库的同一事务中推进；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空（库级约束保证）；
 - `confirmations(id, session_id, sequence, position, torque, idempotency_key, confirmed_at)`：不可变事件，唯一约束 `(session_id, sequence)`、`(session_id, idempotency_key)`。
 
 重置数据：`docker compose down -v`（清空数据卷后 `db/init.sql` 会重新执行）。

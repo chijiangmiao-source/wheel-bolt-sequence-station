@@ -21,6 +21,8 @@ const state = {
   sessionId: localStorage.getItem(SESSION_KEY),
   view: null, // 服务端权威进度
   busy: false, // 是否有提交在途（含自动重试）
+  cancelFormOpen: false, // 是否打开了终止原因填写面板
+  cancelling: false, // 终止请求是否在途
 };
 
 function uuid() {
@@ -90,6 +92,7 @@ async function startSession() {
     state.sessionId = body.session_id;
     localStorage.setItem(SESSION_KEY, state.sessionId);
     state.view = body;
+    state.cancelFormOpen = false;
     $('torque-input').value = '';
     showNotice('新会话已开始，请按顺序复核六颗螺栓');
   } catch {
@@ -163,9 +166,60 @@ async function submitConfirmation() {
   }
 }
 
+/** 打开/关闭终止原因填写面板。 */
+function setCancelForm(open) {
+  state.cancelFormOpen = open;
+  if (open) {
+    $('cancel-reason').value = '';
+    showError('');
+  }
+  render();
+  if (open) $('cancel-reason').focus();
+}
+
+function cancelReasonLength() {
+  return [...$('cancel-reason').value.trim()].length;
+}
+
+/** 带原因终止复核；成功后展示终止时间与原因，扭矩提交随之关闭。 */
+async function cancelSession() {
+  if (state.cancelling || !state.view || state.view.status !== 'in_progress') return;
+  const reason = $('cancel-reason').value.trim();
+  const len = [...reason].length;
+  if (len < 2 || len > 100) {
+    showError('终止原因须为 2–100 字');
+    return;
+  }
+
+  clearMessages();
+  state.cancelling = true;
+  render();
+  try {
+    const { status, body } = await fetchJson(`/sessions/${state.sessionId}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    });
+    if (status === 200) {
+      state.cancelFormOpen = false;
+      await refresh();
+      showNotice(body && body.replayed ? '该会话此前已终止' : '会话已终止复核');
+    } else {
+      const message = (body && body.error && body.error.message) || `HTTP ${status}`;
+      showError(`终止失败：${message}`);
+      // 确定性失败（如已完成/已终止）不重试，以服务端权威进度对齐
+      await refresh();
+    }
+  } catch {
+    showError('网络异常，终止请求未送达，请点击「刷新进度」后重试');
+  } finally {
+    state.cancelling = false;
+    render();
+  }
+}
+
 function render() {
   const view = state.view;
-
   $('session-id').textContent = state.sessionId ? state.sessionId.slice(0, 8) : '—';
   $('session-id').title = state.sessionId || '';
   $('start-hint').hidden = Boolean(view);
@@ -197,10 +251,24 @@ function render() {
   }
 
   const inProgress = Boolean(view) && view.status === 'in_progress';
-  $('work-panel').hidden = !inProgress;
+  $('work-panel').hidden = !inProgress || state.cancelFormOpen;
   if (inProgress) {
     $('current-position').textContent = view.expected_position;
     $('current-seq').textContent = String(view.expected_sequence);
+  }
+
+  // 终止原因填写面板仅在进行中会话上可打开
+  $('cancel-panel').hidden = !inProgress || !state.cancelFormOpen;
+  if (!state.cancelFormOpen) {
+    $('cancel-reason').value = '';
+    $('cancel-reason-hint').textContent = '';
+  }
+
+  const cancelled = Boolean(view) && view.status === 'cancelled';
+  $('cancelled-banner').hidden = !cancelled;
+  if (cancelled) {
+    $('cancelled-at').textContent = new Date(view.cancelled_at).toLocaleString('zh-CN', { hour12: false });
+    $('cancelled-reason').textContent = view.cancel_reason;
   }
 
   const completed = Boolean(view) && view.status === 'completed';
@@ -227,7 +295,10 @@ function render() {
 
   $('btn-submit').disabled = state.busy || !inProgress;
   $('torque-input').disabled = state.busy || !inProgress;
-  $('btn-refresh').disabled = state.busy;
+  $('btn-cancel-open').disabled = state.busy || state.cancelling || !inProgress;
+  $('btn-refresh').disabled = state.busy || state.cancelling;
+  $('btn-cancel-confirm').disabled = state.cancelling;
+  $('btn-cancel-back').disabled = state.cancelling;
 }
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -236,6 +307,14 @@ window.addEventListener('DOMContentLoaded', () => {
   $('btn-submit').addEventListener('click', submitConfirmation);
   $('torque-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitConfirmation();
+  });
+  $('btn-cancel-open').addEventListener('click', () => setCancelForm(true));
+  $('btn-cancel-back').addEventListener('click', () => setCancelForm(false));
+  $('btn-cancel-confirm').addEventListener('click', cancelSession);
+  $('cancel-reason').addEventListener('input', () => {
+    const len = cancelReasonLength();
+    $('cancel-reason-hint').textContent =
+      len === 0 ? '' : `${len} / 100 字（需 2–100 字）`;
   });
   refresh();
 });

@@ -28,6 +28,27 @@ async function postConf(base, sid, payload) {
   return { status: r.status, body: await r.json() };
 }
 
+async function postCancel(base, sid, reason) {
+  const r = await fetch(`${base}/api/sessions/${sid}/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason }),
+  });
+  return { status: r.status, body: await r.json() };
+}
+
+async function confirmSteps(base, sid, n) {
+  for (let i = 0; i < n; i += 1) {
+    const r = await postConf(base, sid, {
+      sequence: i + 1,
+      position: POSITIONS[i],
+      torque: 4500,
+      idempotency_key: key(`step${i + 1}`),
+    });
+    assertEqual(r.status, 201, `第 ${i + 1} 步状态码`);
+  }
+}
+
 /** 协议测试：直接针对 API 的 HTTP 语义。 */
 export async function runProtocol(base, t) {
   await t.test('健康检查返回 200', async () => {
@@ -193,5 +214,148 @@ export async function runProtocol(base, t) {
     }
     const st = await getSession(base, s.session_id);
     assertEqual(st.confirmations[0].torque, 4500, '原始扭矩未被篡改');
+  });
+
+  await t.test('完成两步后终止：返回终止时间与原因，刷新后保持，事件只增不改', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 2);
+    const r = await postCancel(base, s.session_id, '轮毂拆下返修');
+    assertEqual(r.status, 200, '终止状态码');
+    assertEqual(r.body.cancelled, true, '标记已终止');
+    assertEqual(r.body.replayed, false, '首次终止非重放');
+    assertEqual(r.body.progress.status, 'cancelled', '进度状态为已终止');
+    assertEqual(r.body.progress.cancel_reason, '轮毂拆下返修', '进度携带原因');
+    assertEqual(r.body.progress.expected_sequence, null, '终止后无期待序号');
+    assert(Boolean(r.body.progress.cancelled_at), '进度携带终止时间');
+    // 刷新（GET）后原因与时间仍在，已有确认事件原样保留
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'cancelled', '刷新后仍为已终止');
+    assertEqual(st.cancel_reason, '轮毂拆下返修', '刷新后原因保持');
+    assert(Boolean(st.cancelled_at), '刷新后终止时间保持');
+    assertEqual(st.confirmations.length, 2, '已有两条确认事件保留');
+    assertEqual(st.confirmations[1].sequence, 2, '第二条事件序号不变');
+  });
+
+  await t.test('终止后再提交确认：409 session_cancelled 且不写事件', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 2);
+    await postCancel(base, s.session_id, '装夹错误');
+    const r = await postConf(base, s.session_id, {
+      sequence: 3,
+      position: 'A3',
+      torque: 4500,
+      idempotency_key: key('after-cancel'),
+    });
+    assertEqual(r.status, 409, '终止后确认状态码');
+    assertEqual(r.body.error.code, 'session_cancelled', '终止拒绝错误码');
+    assertEqual(r.body.progress.status, 'cancelled', '错误附带最新权威进度');
+    assertEqual(r.body.progress.confirmed_count, 2, '权威进度未推进');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations.length, 2, '不写入新事件');
+    // 同一幂等键再试仍是 session_cancelled（终止判定优先于幂等），仍不写事件
+    const r2 = await postConf(base, s.session_id, {
+      sequence: 3,
+      position: 'A3',
+      torque: 4500,
+      idempotency_key: key('after-cancel'),
+    });
+    assertEqual(r2.status, 409, '重复提交仍被拒绝');
+    assertEqual(r2.body.error.code, 'session_cancelled', '重复提交错误码');
+    const st2 = await getSession(base, s.session_id);
+    assertEqual(st2.confirmations.length, 2, '重复提交仍不写事件');
+  });
+
+  await t.test('重复终止：幂等返回现有结果（原因与时间不变）', async () => {
+    const s = await createSession(base);
+    await postCancel(base, s.session_id, '装夹错误，需重新装夹');
+    const before = await getSession(base, s.session_id);
+    const r = await postCancel(base, s.session_id, '另一个不同的原因');
+    assertEqual(r.status, 200, '重复终止状态码');
+    assertEqual(r.body.replayed, true, '重复终止标记为重放');
+    assertEqual(r.body.progress.cancel_reason, '装夹错误，需重新装夹', '返回现有原因');
+    const after = await getSession(base, s.session_id);
+    assertEqual(after.cancel_reason, '装夹错误，需重新装夹', '原因不被覆盖');
+    assertEqual(after.cancelled_at, before.cancelled_at, '终止时间不被覆盖');
+  });
+
+  await t.test('已完成会话不可终止：409 session_completed 且不改变完成态', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 6);
+    const r = await postCancel(base, s.session_id, '完成后不应被终止');
+    assertEqual(r.status, 409, '已完成终止状态码');
+    assertEqual(r.body.error.code, 'session_completed', '已完成错误码');
+    assertEqual(r.body.progress.status, 'completed', '附带完成态进度');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '仍为完成态');
+    assertEqual(st.confirmations.length, 6, '确认事件不受影响');
+  });
+
+  await t.test('终止原因长度边界与非法请求体：2 与 100 字通过，1、101 字及非字符串 400', async () => {
+    const s1 = await createSession(base);
+    assertEqual((await postCancel(base, s1.session_id, 'a')).status, 400, '1 字拒绝');
+    assertEqual((await postCancel(base, s1.session_id, 'a'.repeat(101))).status, 400, '101 字拒绝');
+    assertEqual((await postCancel(base, s1.session_id, {})).status, 400, '非字符串拒绝');
+    // 被 400 拒绝的会话未终止，仍可正常复核
+    const conf = await postConf(base, s1.session_id, {
+      sequence: 1,
+      position: 'A1',
+      torque: 4500,
+      idempotency_key: key('after-bad-cancel'),
+    });
+    assertEqual(conf.status, 201, '原因非法不影响后续确认');
+
+    const s2 = await createSession(base);
+    const r2 = await postCancel(base, s2.session_id, '返修');
+    assertEqual(r2.status, 200, '2 字通过');
+    const s3 = await createSession(base);
+    const r100 = await postCancel(base, s3.session_id, '原'.repeat(100));
+    assertEqual(r100.status, 200, '100 字通过');
+    assertEqual([...r100.body.progress.cancel_reason].length, 100, '原因长度为 100');
+    // 前后空白被裁剪后按 2 字计
+    const s4 = await createSession(base);
+    const rTrim = await postCancel(base, s4.session_id, '  返修  ');
+    assertEqual(rTrim.status, 200, '两端空白裁剪后达 2 字通过');
+    assertEqual(rTrim.body.progress.cancel_reason, '返修', '保存裁剪后的原因');
+  });
+
+  await t.test('未知会话终止返回 404', async () => {
+    const id = '00000000-0000-0000-0000-000000000000';
+    const r = await postCancel(base, id, '不存在的会话');
+    assertEqual(r.status, 404);
+    assertEqual(r.body.error.code, 'session_not_found');
+  });
+
+  await t.test('最后一步确认与终止并发：只形成一个终态，后到者收到权威进度', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 5);
+    const [conf, canc] = await Promise.all([
+      postConf(base, s.session_id, {
+        sequence: 6,
+        position: 'B3',
+        torque: 4500,
+        idempotency_key: key('last-race'),
+      }),
+      postCancel(base, s.session_id, '最后一步并发终止'),
+    ]);
+    const st = await getSession(base, s.session_id);
+    assert(
+      st.status === 'completed' || st.status === 'cancelled',
+      `终态只能是完成或已终止，实际：${st.status}`,
+    );
+    if (st.status === 'completed') {
+      // 确认先取得行锁：六步落库，终止被拒
+      assertEqual(conf.status, 201, '先到确认成功');
+      assertEqual(canc.status, 409, '后到终止被拒');
+      assertEqual(canc.body.error.code, 'session_completed', '后到终止错误码');
+      assertEqual(canc.body.progress.status, 'completed', '后到终止收到完成态进度');
+      assertEqual(st.confirmations.length, 6, '完成态六条确认');
+    } else {
+      // 终止先取得行锁：确认被拒，事件仍只有前五条
+      assertEqual(canc.status, 200, '先到终止成功');
+      assertEqual(conf.status, 409, '后到确认被拒');
+      assertEqual(conf.body.error.code, 'session_cancelled', '后到确认错误码');
+      assertEqual(conf.body.progress.status, 'cancelled', '后到确认收到已终止进度');
+      assertEqual(st.confirmations.length, 5, '终止态保持五条确认');
+    }
   });
 }
