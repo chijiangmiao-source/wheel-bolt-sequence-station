@@ -13,6 +13,19 @@ CREATE TABLE sessions (
   -- 可选工单码：非空值全表唯一（NULL 互不冲突，历史无码会话无需补值）。
   -- 同一工单码的并发首次打开由该唯一约束兜底，只会绑定一个会话。
   work_order_code   TEXT,
+  -- 轮毂规格：standard 标准型 / heavy 重载型；创建时确定，缺省标准型（历史会话同）
+  wheel_spec        TEXT NOT NULL DEFAULT 'standard'
+                    CONSTRAINT sessions_wheel_spec_check CHECK (wheel_spec IN ('standard', 'heavy')),
+  -- 创建时固化的六步合格范围快照（cN·m，含边界），确认按快照校验；
+  -- 默认值即标准型原 4200–4800 规则：历史会话迁移时由该默认值原地回填
+  step_ranges       JSONB NOT NULL DEFAULT '[
+    {"sequence":1,"position":"A1","min":4200,"max":4800},
+    {"sequence":2,"position":"B2","min":4200,"max":4800},
+    {"sequence":3,"position":"A3","min":4200,"max":4800},
+    {"sequence":4,"position":"B1","min":4200,"max":4800},
+    {"sequence":5,"position":"A2","min":4200,"max":4800},
+    {"sequence":6,"position":"B3","min":4200,"max":4800}
+  ]'::jsonb,
   -- 终止原因与终止时间：仅 status = 'cancelled' 时非空，长度 2–100 字
   cancel_reason     TEXT,
   cancelled_at      TIMESTAMPTZ,
@@ -33,8 +46,10 @@ CREATE TABLE confirmations (
   session_id      UUID NOT NULL REFERENCES sessions (id),
   sequence        INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 6),
   position        TEXT NOT NULL CHECK (position IN ('A1', 'B2', 'A3', 'B1', 'A2', 'B3')),
-  -- 标准扭矩：换算后的整数 cN·m，既有顺序/范围/幂等判定与历史展示均以此为准
-  torque          INTEGER NOT NULL CHECK (torque BETWEEN 4200 AND 4800),
+  -- 标准扭矩：换算后的整数 cN·m，既有顺序/范围/幂等判定与历史展示均以此为准。
+  -- 行级 CHECK 为两种规格六步范围的包络（标准型 4200–4800、重载型 4600–5200），
+  -- 逐步精确范围由应用层按会话快照校验
+  torque          INTEGER NOT NULL CHECK (torque BETWEEN 4200 AND 5200),
   -- 原始读数与录入单位：操作工实际录入的值（N·m 保留至多两位小数），仅作记录；
   -- 统一存为普通十进制文本以保真（如 42.00），标准字段 torque 才用于业务判定
   torque_input    TEXT NOT NULL CHECK (torque_input ~ '^[0-9]+(\.[0-9]+)?$'),

@@ -12,6 +12,7 @@
     <h1>轮毂复核工位</h1>
     <div class="session-bar">
       <span>工单码：<code id="workorder-code">—</code></span>
+      <span>规格：<code id="wheel-spec">—</code></span>
       <span>会话：<code id="session-id">—</code></span>
       <span id="progress-text"></span>
       <button id="btn-switch" type="button">打开其他工单</button>
@@ -27,6 +28,11 @@
       <input id="workorder-input" type="text" autocomplete="off"
              inputmode="text" placeholder="输入或扫码工单码">
     </label>
+    <fieldset class="units spec" aria-label="轮毂规格">
+      <legend>轮毂规格（新会话按所选规格创建）</legend>
+      <label><input type="radio" name="wheel-spec" value="standard" checked> 标准型（各位置 4200–4800 cN·m）</label>
+      <label><input type="radio" name="wheel-spec" value="heavy"> 重载型（A 位 4600–5000、B 位 4800–5200 cN·m）</label>
+    </fieldset>
     <div class="entry-actions">
       <button id="btn-open" type="button">打开复核</button>
       <span class="entry-alt">或</span>
@@ -41,6 +47,7 @@
       当前螺栓：<strong id="current-position" class="position"></strong>
       <span class="step">（第 <span id="current-seq"></span> / 6 步）</span>
     </p>
+    <p class="range-line">当前合格范围：<strong id="current-range"></strong>（含边界）</p>
     <fieldset class="units" aria-label="录入单位">
       <legend>录入单位</legend>
       <label><input type="radio" name="unit" value="cN·m" checked> cN·m（工位默认，整数）</label>

@@ -617,6 +617,122 @@ export async function runBrowser(webBase, apiBase, t) {
       await closePage(page);
     });
 
+    await t.test('重载型：先选规格再复核，逐步展示当前范围，4800 在 A/B 步均可接受，刷新后规格与范围不变', async () => {
+      const page = await freshPage();
+      await page.waitForSelector('#entry-panel:not([hidden])');
+      // 先选重载型规格，再开始原有六步复核
+      await page.check('input[name="wheel-spec"][value="heavy"]');
+      await page.click('#btn-new');
+      await page.waitForSelector('#work-panel:not([hidden])');
+      assert((await page.textContent('#wheel-spec')).includes('重载型'), '顶栏应显示重载型');
+
+      // 第 1 步 A1：当前范围 4600–5000；4800 在 A 位可接受
+      await page.waitForFunction(
+        () => document.getElementById('current-range').textContent.includes('4600–5000'),
+      );
+      assertEqual(await currentPosition(page), 'A1', '从 A1 开始');
+      await confirmCurrent(page, 4800);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      // 第 2 步 B2：当前范围切换为 4800–5200；4800 在 B 位同样可接受
+      await page.waitForFunction(
+        () => document.getElementById('current-range').textContent.includes('4800–5200'),
+      );
+      await confirmCurrent(page, 4800);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+
+      // 刷新后：规格与当前范围（第 3 步 A 位 4600–5000）不变
+      await page.reload();
+      await page.waitForSelector('#work-panel:not([hidden])');
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+      assert((await page.textContent('#wheel-spec')).includes('重载型'), '刷新后仍显示重载型');
+      assert(
+        (await page.textContent('#current-range')).includes('4600–5000'),
+        '刷新后当前范围仍为 A 位 4600–5000',
+      );
+      assertEqual(await page.locator('#bolt-list li.done').count(), 2, '刷新后两步仍有效');
+
+      // 按 A/B 差异范围完成剩余步骤：A3 4600（下限）、B1 5200（上限）、A2 5000（上限）、B3 4800（下限）
+      for (const [pos, torque] of [['A3', 4600], ['B1', 5200], ['A2', 5000], ['B3', 4800]]) {
+        await page.waitForFunction(
+          (p) => document.getElementById('current-position').textContent.trim() === p,
+          pos,
+        );
+        await confirmCurrent(page, torque);
+      }
+      await page.waitForSelector('#done-banner:not([hidden])');
+      const st = await serverState(page);
+      assertEqual(st.status, 'completed', '重载型六步后完成');
+      assertEqual(st.wheel_spec, 'heavy', '服务端规格为重载型');
+      assertEqual(st.confirmations.length, 6, '六条确认事件');
+      assertEqual(st.confirmations[0].torque, 4800, 'A1 记录 4800');
+      assertEqual(st.confirmations[1].torque, 4800, 'B2 记录 4800');
+      await closePage(page);
+    });
+
+    await t.test('重载型：4799 在 B 位被页面拒绝并停留原步骤，修正后继续', async () => {
+      const page = await freshPage();
+      await page.waitForSelector('#entry-panel:not([hidden])');
+      await page.check('input[name="wheel-spec"][value="heavy"]');
+      await page.click('#btn-new');
+      await page.waitForSelector('#work-panel:not([hidden])');
+      await confirmCurrent(page, 4800); // A1 通过
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      // B2 录入 4799：标准型下合格，但重载型 B 位下限 4800，应被拒绝并停留
+      await confirmCurrent(page, 4799);
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('拒绝'));
+      const err = await page.textContent('#error');
+      assert(err.includes('4800–5200'), `拒绝原因应给出 B 位范围，实际：${err}`);
+      assertEqual(await currentPosition(page), 'B2', '拒绝后仍停留在 B2');
+      const st0 = await serverState(page);
+      assertEqual(st0.confirmations.length, 1, '失败不写确认事件');
+      assertEqual(st0.expected_sequence, 2, '服务端仍期待第 2 步');
+      // 修正为 4800 后正常推进
+      await confirmCurrent(page, 4800);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+      await closePage(page);
+    });
+
+    await t.test('工单码打开重载型工单：规格随会话固化，另一终端接续同一规格', async () => {
+      const code = newCode('heavy');
+      const p1 = await freshPage();
+      await p1.waitForSelector('#entry-panel:not([hidden])');
+      await p1.check('input[name="wheel-spec"][value="heavy"]');
+      await p1.fill('#workorder-input', code);
+      await p1.click('#btn-open');
+      await p1.waitForSelector('#work-panel:not([hidden])');
+      assert((await p1.textContent('#wheel-spec')).includes('重载型'), '应按重载型创建');
+      await confirmCurrent(p1, 4900);
+      await p1.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+
+      // 另一终端（默认标准型选择）打开同一码：以既有会话的重载型为准
+      const p2 = await freshPage();
+      await p2.waitForSelector('#entry-panel:not([hidden])');
+      await p2.fill('#workorder-input', code);
+      await p2.click('#btn-open');
+      await p2.waitForSelector('#work-panel:not([hidden])');
+      assert((await p2.textContent('#wheel-spec')).includes('重载型'), '接续会话仍为重载型');
+      assert(
+        (await p2.textContent('#current-range')).includes('4800–5200'),
+        '当前范围为 B 位 4800–5200',
+      );
+      const st = await serverState(p2);
+      assertEqual(st.wheel_spec, 'heavy', '服务端会话为重载型');
+      await closePage(p1);
+      await closePage(p2);
+    });
+
     await t.test('旧客户端只使用原三个接口：新建会话后按原六步完成', async () => {
       // 模拟没有终止功能的旧客户端：只用 POST /sessions、GET /sessions/:id、
       // POST /confirmations，且按原载荷/原字段解析响应，全程不调用 /cancel。

@@ -26,17 +26,11 @@ const UNIT_CNM = 'cN·m';
 const UNIT_NM = 'N·m';
 // 工位默认录入单位保持 cN·m；操作工可切换到 N·m（最多两位小数）
 const DEFAULT_UNIT = UNIT_CNM;
-// 各单位的输入约束（N·m 为 cN·m 合格范围除以 100）
-const UNIT_RULES = {
-  [UNIT_CNM]: {
-    label: '扭矩（cN·m，合格范围 4200–4800，含边界）',
-    step: '1', min: '4200', max: '4800', placeholder: '例如 4500',
-  },
-  [UNIT_NM]: {
-    label: '扭矩（N·m，合格范围 42.00–48.00，含边界，最多两位小数）',
-    step: '0.01', min: '42.00', max: '48.00', placeholder: '例如 45.00',
-  },
-};
+
+// 轮毂规格中文名（服务端规格代号的展示映射）
+const SPEC_LABELS = { standard: '标准型', heavy: '重载型' };
+// 无会话时的兜底范围（进入会话后始终以服务端快照的当前范围为准）
+const FALLBACK_RANGE = { min: 4200, max: 4800 };
 
 const $ = (id) => document.getElementById(id);
 
@@ -51,6 +45,7 @@ const state = {
   retracting: false, // 撤回请求是否在途
   opening: false, // 是否有「打开复核 / 开始会话」请求在途
   unit: DEFAULT_UNIT,
+  wheelSpec: 'standard', // 进入区选择的规格：新会话按所选规格创建
 };
 
 // 「打开其他工单」时暂存的本地现场：新工单打开失败则恢复原会话
@@ -171,21 +166,39 @@ async function refresh() {
 
 /** 切换录入单位：cN·m 为工位默认，N·m 限两位小数。 */
 function switchUnit(unit) {
-  if (!UNIT_RULES[unit] || state.busy || unit === state.unit) return;
+  if (![UNIT_CNM, UNIT_NM].includes(unit) || state.busy || unit === state.unit) return;
   state.unit = unit;
   $('torque-input').value = '';
   clearMessages();
   renderUnitControls();
 }
 
+/** 当前步骤的合格范围（服务端快照）；无会话视图时用兜底范围。 */
+function currentRange() {
+  return state.view && state.view.current_range ? state.view.current_range : FALLBACK_RANGE;
+}
+
+/** 按当前单位与当前步骤范围渲染输入约束（N·m 范围为 cN·m 范围除以 100）。 */
 function renderUnitControls() {
-  const rule = UNIT_RULES[state.unit];
+  const range = currentRange();
   const input = $('torque-input');
-  $('torque-label').textContent = rule.label;
-  input.step = rule.step;
-  input.min = rule.min;
-  input.max = rule.max;
-  input.placeholder = rule.placeholder;
+  if (state.unit === UNIT_CNM) {
+    $('torque-label').textContent =
+      `扭矩（cN·m，合格范围 ${range.min}–${range.max}，含边界）`;
+    input.step = '1';
+    input.min = String(range.min);
+    input.max = String(range.max);
+    input.placeholder = `例如 ${Math.round((range.min + range.max) / 2)}`;
+  } else {
+    const minNm = (range.min / 100).toFixed(2);
+    const maxNm = (range.max / 100).toFixed(2);
+    $('torque-label').textContent =
+      `扭矩（N·m，合格范围 ${minNm}–${maxNm}，含边界，最多两位小数）`;
+    input.step = '0.01';
+    input.min = minNm;
+    input.max = maxNm;
+    input.placeholder = `例如 ${((range.min + range.max) / 200).toFixed(2)}`;
+  }
   document.querySelectorAll('input[name="unit"]').forEach((radio) => {
     radio.checked = radio.value === state.unit;
     radio.disabled = state.busy;
@@ -230,7 +243,12 @@ async function openByWorkOrder() {
     try {
       ({ status, body } = await fetchJson(
         `/work-orders/${encodeURIComponent(code)}/session`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // 规格仅在首次创建该工单会话时生效；已绑定会话以其固化规格为准
+          body: JSON.stringify({ wheel_spec: state.wheelSpec }),
+        },
       ));
     } catch {
       // 查询或创建暂时失败：保留本地已有会话，不覆盖
@@ -272,7 +290,11 @@ async function startSession() {
   state.opening = true;
   render();
   try {
-    const { status, body } = await fetchJson('/sessions', { method: 'POST' });
+    const { status, body } = await fetchJson('/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wheel_spec: state.wheelSpec }),
+    });
     if (status !== 201) {
       showError('创建会话失败，请重试');
     } else {
@@ -466,6 +488,10 @@ function render() {
   $('session-id').title = state.sessionId || '';
   $('workorder-code').textContent = state.workOrderCode || '—';
   $('workorder-code').title = state.workOrderCode || '';
+  // 规格以服务端会话视图为准（刷新后保持不变）
+  const specLabel = view && view.wheel_spec ? SPEC_LABELS[view.wheel_spec] : null;
+  $('wheel-spec').textContent = specLabel || '—';
+  $('wheel-spec').title = view && view.wheel_spec ? view.wheel_spec : '';
 
   // 进入区只在没有会话视图时显示；进入会话后整个复核链路复用原有展示
   $('entry-panel').hidden = Boolean(view);
@@ -502,6 +528,10 @@ function render() {
   if (inProgress) {
     $('current-position').textContent = view.expected_position;
     $('current-seq').textContent = String(view.expected_sequence);
+    // 逐步展示当前步骤的合格范围（按会话快照，重载型 A/B 位不同）
+    const range = currentRange();
+    $('current-range').textContent = `${range.min}–${range.max} cN·m`;
+    renderUnitControls();
   }
 
   // 撤回上一步：仅进行中且存在有效确认时可操作（尚未完成、至少确认过一颗）
@@ -566,6 +596,10 @@ function render() {
   $('btn-open').disabled = state.busy || state.retracting || state.opening;
   $('btn-new').disabled = state.busy || state.retracting || state.opening;
   $('workorder-input').disabled = state.busy || state.retracting || state.opening;
+  document.querySelectorAll('input[name="wheel-spec"]').forEach((radio) => {
+    radio.checked = radio.value === state.wheelSpec;
+    radio.disabled = state.busy || state.retracting || state.opening;
+  });
   document.querySelectorAll('input[name="unit"]').forEach((radio) => {
     radio.disabled =
       state.busy || state.cancelling || state.retracting || state.opening || !inProgress;
@@ -655,6 +689,11 @@ window.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('input[name="unit"]').forEach((radio) => {
     radio.addEventListener('change', () => {
       if (radio.checked) switchUnit(radio.value);
+    });
+  });
+  document.querySelectorAll('input[name="wheel-spec"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      if (radio.checked) state.wheelSpec = radio.value;
     });
   });
   $('torque-input').addEventListener('keydown', (e) => {

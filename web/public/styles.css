@@ -228,6 +228,11 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .position { font-size: 26px; }
 .step { color: var(--muted); font-size: 14px; }
 
+.range-line { margin: 0 0 14px; color: var(--muted); font-size: 15px; }
+.range-line strong { color: var(--ink); font-size: 17px; }
+
+.spec { margin: 0 0 14px; }
+
 .field { display: block; margin-bottom: 14px; color: var(--muted); font-size: 14px; }
 
 .field input {

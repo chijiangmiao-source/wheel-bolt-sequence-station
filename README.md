@@ -2,6 +2,8 @@
 
 触屏工位 + API 的真实联调项目：操作工按固定顺序 **A1 → B2 → A3 → B1 → A2 → B3** 逐颗复核轮毂的六颗螺栓，服务端以 PostgreSQL 持久化会话与**不可变确认事件**，只有在六次有效确认全部落库后才判定「轮毂复核完成」。
 
+现场承接**标准型**与**重载型**两种轮毂：复核顺序相同，但各位置合格扭矩不同（标准型各位置 4200–4800 cN·m；重载型 A 位 4600–5000、B 位 4800–5200 cN·m）。操作工先选规格再开始六步复核；会话创建时把六步范围**固化为快照**随会话持久化，确认校验、页面展示与进度查询均以快照为准。
+
 针对现场两类典型故障做了明确的协议设计：
 
 - **触屏重试 / 网络重试导致同一颗螺栓被记两次** → 幂等键去重：同一幂等键 + 完全相同载荷的重试返回**原确认**，不产生第二条记录；
@@ -46,20 +48,34 @@ docker compose run --rm verify
 
 验收覆盖：
 
-- **协议用例**（直连 API）：固定顺序、边界扭矩和幂等冲突；N·m 精确换算、精度与越界拒绝、跨单位幂等重放及旧格式客户端；工单码首次与重复打开、跨终端续作、并发首次打开和非法码；带原因终止、终止后拒绝、重复终止、完成态保护及最后一步与终止并发；迟到、越序、位置、扭矩、未知会话与缺字段拒绝、并发去重和数据库事件不可变；撤回上一步（撤回第二步以新扭矩重做后完成、刷新后只有重做记录且保留审计、重复撤回与无可撤回拒绝、完成态/终止态保护、两个撤回竞争只成功一次、撤回与确认并发、撤回事件不可变）；
-- **页面用例**（真实 Chromium 驱动页面）：六步完成、异常扭矩、刷新恢复、网络重试、慢响应连点和完成态刷新；N·m 边界读数、越界与精度拒绝及历史 cN·m 展示；新工单、另一浏览器接续、并发首次打开、非法码及无码旧流程；完成两步后终止、展示并持久化原因与时间、关闭扭矩提交；二次确认撤回第二步并以新扭矩重做完成、刷新后只显示重做记录且保留撤回审计、并发先撤回时页面收到明确原因并保留当前输入。
+- **协议用例**（直连 API）：固定顺序、边界扭矩和幂等冲突；N·m 精确换算、精度与越界拒绝、跨单位幂等重放及旧格式客户端；工单码首次与重复打开、跨终端续作、并发首次打开和非法码；带原因终止、终止后拒绝、重复终止、完成态保护及最后一步与终止并发；迟到、越序、位置、扭矩、未知会话与缺字段拒绝、并发去重和数据库事件不可变；撤回上一步（撤回第二步以新扭矩重做后完成、刷新后只有重做记录且保留审计、重复撤回与无可撤回拒绝、完成态/终止态保护、两个撤回竞争只成功一次、撤回与确认并发、撤回事件不可变）；轮毂规格（重载型按 A/B 差异范围完成六步、4800 在相邻 A/B 步均可接受、4799 在 B 位与 4599 在 A 位被拒绝并停留原步骤、未知规格 400、未传规格默认标准型并按原 4200–4800 完成、查询返回规格/完整范围/当前范围且刷新后不变、工单码打开携带规格、历史会话迁移回填后按原规则解释）；
+- **页面用例**（真实 Chromium 驱动页面）：六步完成、异常扭矩、刷新恢复、网络重试、慢响应连点和完成态刷新；N·m 边界读数、越界与精度拒绝及历史 cN·m 展示；新工单、另一浏览器接续、并发首次打开、非法码及无码旧流程；完成两步后终止、展示并持久化原因与时间、关闭扭矩提交；二次确认撤回第二步并以新扭矩重做完成、刷新后只显示重做记录且保留撤回审计、并发先撤回时页面收到明确原因并保留当前输入；先选重载型规格再复核、逐步展示当前范围、4800 在 A/B 步均可接受、4799 在 B 位被页面拒绝并停留、刷新后规格与当前范围不变、重载型工单跨终端接续同一规格。
 
 ## API 协议
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/sessions` | 开始新会话（固定顺序 A1→B2→A3→B1→A2→B3），返回 `201` 与初始进度（旧客户端协议，继续可用） |
-| POST | `/api/work-orders/{code}/session` | **按工单码打开复核**：同一事务内返回已绑定会话（`200`），尚未绑定时才创建（`201`） |
-| GET | `/api/sessions/{id}` | 读取权威进度（页面刷新后以此为准） |
-| POST | `/api/sessions/{id}/confirmations` | 提交一次复核确认 |
+| POST | `/api/sessions` | 开始新会话（固定顺序 A1→B2→A3→B1→A2→B3），返回 `201` 与初始进度；可选请求体 `{ "wheel_spec": "standard" \| "heavy" }`，未传或空请求体仍创建标准型会话（旧客户端协议，继续可用） |
+| POST | `/api/work-orders/{code}/session` | **按工单码打开复核**：同一事务内返回已绑定会话（`200`），尚未绑定时才创建（`201`）；可选请求体 `{ "wheel_spec" }` 仅在首次创建时生效 |
+| GET | `/api/sessions/{id}` | 读取权威进度（页面刷新后以此为准），返回规格、完整六步范围与当前范围 |
+| POST | `/api/sessions/{id}/confirmations` | 提交一次复核确认（按会话快照校验当前步骤范围） |
 | POST | `/api/sessions/{id}/confirmations/last/retract` | **撤回上一步**：为当前最后一条有效确认追加不可变撤回事件并回到该颗，随后可重新确认 |
 | POST | `/api/sessions/{id}/cancel` | 带原因终止复核（拆下返修/装夹错误），幂等可重放 |
 | GET | `/healthz` | 健康检查 |
+
+### 轮毂规格与逐步合格范围
+
+- 创建会话时可提交 `wheel_spec`：`standard`（标准型）或 `heavy`（重载型）；**未传仍创建标准型会话**，空请求体创建语义不变。未知规格返回 `400 unknown_wheel_spec`（中文原因可直接展示），不创建会话；
+- 六步合格范围（cN·m，含边界）在**创建时固化为快照**随会话持久化，确认校验只认快照：
+  - 标准型：六个位置均 **4200–4800**（即历史规则，历史会话迁移后同样按此解释）；
+  - 重载型：**A 位（A1/A3/A2）4600–5000**、**B 位（B2/B1/B3）4800–5200**——因此 4800 在相邻 A、B 步均可接受，而 4799 在 B 位、4599 在 A 位会被拒绝；
+- 会话视图（创建/查询/工单打开的响应）携带：
+  - `wheel_spec`：规格代号；
+  - `step_ranges`：完整六步范围快照 `[{ sequence, position, min, max }]`；
+  - `current_range`：当前期待步骤的范围（进行中），会话完成/终止后为 `null`；确认、终止、撤回响应的 `progress` 中同样携带；
+  - 既有 `torque_range` 字段保留，为全部步骤范围的包络（标准型即原 4200–4800），旧客户端字段解析不受影响；
+- 不符合当前位置范围的读数返回 `422 torque_out_of_range`，原因中给出当前步骤与范围（如「超出第 2 步（B2）合格范围 4800–5200 cN·m」），**不写确认事件、停留原步骤**；
+- 页面进入区先选规格再开始复核（工单码打开同样在首次创建时按所选规格固化）；复核中逐步展示当前合格范围，刷新后规格与当前范围从服务端恢复、保持不变。
 
 ### 工单码绑定（换班 / 换触屏 / 清理浏览器后接续）
 
@@ -114,7 +130,7 @@ docker compose run --rm verify
    - `sequence < 当前期待序号` → `409 late_sequence`（迟到响应，拒绝）；
    - `sequence > 当前期待序号` → `409 out_of_order_sequence`（越序，拒绝）。
 3. **位置校验**：位置码与当前期待步骤不符 → `422 position_mismatch`。
-4. **扭矩校验**：服务端先按 `unit` 把读数精确换算为整数 cN·m（缺省单位按 cN·m），再判定 4200–4800（含边界）→ `422 torque_out_of_range`；N·m 超过两位小数 → `422 torque_precision_exceeded`；无法精确换算 → `422 torque_unconvertible`；非整数 cN·m、非法单位等非法请求体 → `400 invalid_body`；未知会话 → `404 session_not_found`。
+4. **扭矩校验**：服务端先按 `unit` 把读数精确换算为整数 cN·m（缺省单位按 cN·m），再按**会话快照中当前步骤的范围**判定（标准型 4200–4800、重载型 A 位 4600–5000 / B 位 4800–5200，含边界）→ `422 torque_out_of_range`；N·m 超过两位小数 → `422 torque_precision_exceeded`；无法精确换算 → `422 torque_unconvertible`；非整数 cN·m、非法单位等非法请求体 → `400 invalid_body`；未知会话 → `404 session_not_found`。
 
 并发与一致性：同一会话的提交在事务内以 `SELECT ... FOR UPDATE` 行锁串行化；`(session_id, idempotency_key)` 唯一约束与「每序号至多一条有效确认」触发器兜底，因此并发重试/触屏连点最多落库一条确认。确认事件表与撤回事件表均由触发器禁止 `UPDATE/DELETE`，是只增不改的事件日志。
 
@@ -176,8 +192,8 @@ docker compose run --rm verify
 
 ## 数据模型
 
-- `sessions(id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调推进（1→7），只在有效确认落库的同一事务中递增，在撤回上一步的同一事务中回退到被撤回序号（有效确认始终形成 `1..k` 前缀）；`work_order_code` 可空且非空值全表唯一；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空；
-- `confirmations(id, session_id, sequence, position, torque, torque_input, torque_unit, idempotency_key, confirmed_at)`：不可变事件，`torque` 为换算后的整数 cN·m 标准字段，`torque_input`/`torque_unit` 保存操作工原始读数与单位；唯一约束 `(session_id, idempotency_key)`；同一序号在撤回后允许重新确认，因此可能保留多条历史确认，由触发器保证任一时刻每个序号至多一条**有效**（无撤回事件）记录；
+- `sessions(id, status, expected_sequence, work_order_code, wheel_spec, step_ranges, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调推进（1→7），只在有效确认落库的同一事务中递增，在撤回上一步的同一事务中回退到被撤回序号（有效确认始终形成 `1..k` 前缀）；`work_order_code` 可空且非空值全表唯一；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空；`wheel_spec` 为 `standard`/`heavy`（缺省 `standard`），`step_ranges` 为创建时固化的六步合格范围快照（JSONB）——API 启动时执行幂等迁移，历史会话由列默认值原地回填为标准型 + 原 4200–4800 快照，迁移后按原规则解释；
+- `confirmations(id, session_id, sequence, position, torque, torque_input, torque_unit, idempotency_key, confirmed_at)`：不可变事件，`torque` 为换算后的整数 cN·m 标准字段（行级 CHECK 为两种规格的包络 4200–5200，逐步精确范围由应用层按会话快照校验），`torque_input`/`torque_unit` 保存操作工原始读数与单位；唯一约束 `(session_id, idempotency_key)`；同一序号在撤回后允许重新确认，因此可能保留多条历史确认，由触发器保证任一时刻每个序号至多一条**有效**（无撤回事件）记录；
 - `confirmation_retractions(id, session_id, confirmation_id, sequence, retracted_at)`：不可变撤回事件，`confirmation_id` 唯一（每条确认至多被撤回一次，并发撤回只成功一次）；确认是否有效完全由是否存在对应撤回事件决定，确认行本身永不删除/改写。撤回事件同样禁止 UPDATE/DELETE。
 
 重置数据：`docker compose down -v`（清空数据卷后 `db/init.sql` 会重新执行）。

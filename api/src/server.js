@@ -1,5 +1,6 @@
 import { createApp } from './app.js';
 import { pool } from './db.js';
+import { migrate } from './migrate.js';
 
 const port = Number(process.env.PORT || 3000);
 
@@ -17,6 +18,8 @@ async function waitForDb(attempts = 30) {
 }
 
 await waitForDb();
+// 启动前执行幂等结构迁移：历史会话回填为标准型 + 原 4200–4800 快照
+await migrate(pool);
 const app = createApp();
 app.listen(port, () => {
   console.log(`轮毂复核 API 已监听 :${port}`);

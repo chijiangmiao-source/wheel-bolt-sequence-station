@@ -861,4 +861,263 @@ export async function runProtocol(base, t) {
     const done = await getSession(base, s.session_id);
     assertEqual(done.status, 'completed', '旧会话六步后完成');
   });
+
+  await t.test('重载型会话：创建时固化 A/B 差异范围快照，按各自范围完成六步', async () => {
+    const r = await fetch(`${base}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wheel_spec: 'heavy' }),
+    });
+    assertEqual(r.status, 201, '重载型创建状态码');
+    const s = await r.json();
+    assertEqual(s.wheel_spec, 'heavy', '会话规格为重载型');
+    assertEqual(s.step_ranges.length, 6, '快照包含六步范围');
+    for (const [i, pos] of POSITIONS.entries()) {
+      const range = s.step_ranges[i];
+      assertEqual(range.sequence, i + 1, `第 ${i + 1} 步序号`);
+      assertEqual(range.position, pos, `第 ${i + 1} 步位置`);
+      const isA = pos.startsWith('A');
+      assertEqual(range.min, isA ? 4600 : 4800, `${pos} 下限`);
+      assertEqual(range.max, isA ? 5000 : 5200, `${pos} 上限`);
+    }
+    assertEqual(s.current_range.min, 4600, '当前范围为第 1 步 A 位下限');
+    assertEqual(s.current_range.max, 5000, '当前范围为第 1 步 A 位上限');
+    // A 位边界 4600/5000、B 位边界 4800/5200 均合格；B3 步用 N·m 52.00 验证换算与快照组合
+    const torques = [4600, 5200, 5000, 4800, 4700, '52.00'];
+    for (let i = 0; i < 6; i += 1) {
+      const payload = {
+        sequence: i + 1,
+        position: POSITIONS[i],
+        torque: torques[i],
+        idempotency_key: key(`heavy-${i}`),
+      };
+      if (i === 5) payload.unit = 'N·m';
+      const c = await postConf(base, s.session_id, payload);
+      assertEqual(c.status, 201, `重载型第 ${i + 1} 步（${POSITIONS[i]} ${torques[i]}）状态码`);
+      assertEqual(c.body.confirmation.torque, [4600, 5200, 5000, 4800, 4700, 5200][i], `第 ${i + 1} 步标准扭矩`);
+    }
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '重载型六步后完成');
+    assertEqual(st.wheel_spec, 'heavy', '完成后规格保持');
+    assertEqual(st.step_ranges.length, 6, '完成后完整范围仍在');
+    assertEqual(st.current_range, null, '完成后无当前范围');
+    assertEqual(st.confirmations.length, 6, '六条确认事件');
+  });
+
+  await t.test('重载型：4800 在相邻 A、B 步均可接受', async () => {
+    const r = await fetch(`${base}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wheel_spec: 'heavy' }),
+    });
+    const s = await r.json();
+    const a = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4800, idempotency_key: key('h4800-a'),
+    });
+    assertEqual(a.status, 201, '4800 在 A1（4600–5000）应合格');
+    const b = await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4800, idempotency_key: key('h4800-b'),
+    });
+    assertEqual(b.status, 201, '4800 在 B2（4800–5200）应合格');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.expected_sequence, 3, '两步均推进');
+    assertEqual(st.confirmations.length, 2, '两条确认事件');
+  });
+
+  await t.test('重载型：4799 在 B 位、4599 在 A 位被拒绝，给出范围原因并停留原步骤', async () => {
+    const r = await fetch(`${base}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wheel_spec: 'heavy' }),
+    });
+    const s = await r.json();
+    // A 位下限 4600：4599 拒绝（标准型下该读数原本合格）
+    const low = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4599, idempotency_key: key('h4599'),
+    });
+    assertEqual(low.status, 422, 'A 位 4599 状态码');
+    assertEqual(low.body.error.code, 'torque_out_of_range', 'A 位越界错误码');
+    assert(low.body.error.message.includes('4600–5000'), '原因给出 A 位范围');
+    assertEqual(low.body.progress.expected_sequence, 1, '拒绝后停留第 1 步');
+    // 第 1 步以 4800 通过，随后 B 位 4799 拒绝（标准型下该读数原本合格）
+    const ok = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4800, idempotency_key: key('h4800-ok'),
+    });
+    assertEqual(ok.status, 201, '第 1 步 4800 通过');
+    const rej = await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4799, idempotency_key: key('h4799'),
+    });
+    assertEqual(rej.status, 422, 'B 位 4799 状态码');
+    assertEqual(rej.body.error.code, 'torque_out_of_range', 'B 位越界错误码');
+    assert(rej.body.error.message.includes('4800–5200'), '原因给出 B 位范围');
+    assertEqual(rej.body.progress.expected_sequence, 2, '拒绝后停留第 2 步');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations.length, 1, '失败不写确认事件');
+    assertEqual(st.expected_sequence, 2, '进度停留原步骤');
+    // 修正为 4800 后正常推进
+    const fix = await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4800, idempotency_key: key('h4800-fix'),
+    });
+    assertEqual(fix.status, 201, '修正后 B 位 4800 通过');
+  });
+
+  await t.test('未知规格：创建会话与工单打开均返回 400 与可展示原因，不创建会话', async () => {
+    const bad = await fetch(`${base}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wheel_spec: 'ultra' }),
+    });
+    assertEqual(bad.status, 400, '未知规格状态码');
+    const badBody = await bad.json();
+    assertEqual(badBody.error.code, 'unknown_wheel_spec', '未知规格错误码');
+    assert(badBody.error.message.includes('ultra'), '原因包含所传规格');
+    // 工单码打开携带未知规格同样拒绝，且不产生绑定会话
+    const code = woCode('bad-spec');
+    const badWo = await fetch(
+      `${base}/api/work-orders/${encodeURIComponent(code)}/session`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wheel_spec: 'ultra' }),
+      },
+    );
+    assertEqual(badWo.status, 400, '工单打开未知规格状态码');
+    assertEqual((await badWo.json()).error.code, 'unknown_wheel_spec', '工单打开错误码');
+    const after = await openWorkOrder(base, code);
+    assertEqual(after.status, 201, '失败后该工单码仍未绑定，可重新创建');
+    assertEqual(after.body.wheel_spec, 'standard', '未传规格默认标准型');
+  });
+
+  await t.test('未传规格默认标准型：快照为原 4200–4800，旧格式客户端按原范围完成', async () => {
+    // 空请求体创建（旧客户端语义）
+    const r = await fetch(`${base}/api/sessions`, { method: 'POST' });
+    assertEqual(r.status, 201, '空请求体创建状态码');
+    const s = await r.json();
+    assertEqual(s.wheel_spec, 'standard', '缺省为标准型');
+    assertEqual(s.step_ranges.length, 6, '标准型快照六步');
+    for (const range of s.step_ranges) {
+      assertEqual(range.min, 4200, '标准型每步下限 4200');
+      assertEqual(range.max, 4800, '标准型每步上限 4800');
+    }
+    assertEqual(s.current_range.min, 4200, '当前范围下限 4200');
+    assertEqual(s.current_range.max, 4800, '当前范围上限 4800');
+    // 旧格式客户端（整数 torque、不传 unit）按原范围完成六步，含原边界
+    const torques = [4200, 4800, 4500, 4200, 4800, 4600];
+    for (let i = 0; i < 6; i += 1) {
+      const c = await postConf(base, s.session_id, {
+        sequence: i + 1,
+        position: POSITIONS[i],
+        torque: torques[i],
+        idempotency_key: key(`std-${i}`),
+      });
+      assertEqual(c.status, 201, `标准型第 ${i + 1} 步状态码`);
+    }
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '标准型六步后完成');
+    assertEqual(st.wheel_spec, 'standard', '规格保持标准型');
+    // 原范围外读数仍被拒绝（4199/4801）
+    const s2 = await createSession(base);
+    for (const torque of [4199, 4801]) {
+      const c = await postConf(base, s2.session_id, {
+        sequence: 1, position: 'A1', torque, idempotency_key: key('std-range'),
+      });
+      assertEqual(c.status, 422, `标准型 ${torque} 状态码`);
+      assert(c.body.error.message.includes('4200–4800'), '原因给出原范围');
+    }
+  });
+
+  await t.test('重载型会话查询进度返回规格、完整范围与当前范围，刷新后不变', async () => {
+    const r = await fetch(`${base}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wheel_spec: 'heavy' }),
+    });
+    const s = await r.json();
+    for (const [seq, pos, torque] of [[1, 'A1', 4600], [2, 'B2', 5200]]) {
+      const c = await postConf(base, s.session_id, {
+        sequence: seq, position: pos, torque, idempotency_key: key(`hprog-${seq}`),
+      });
+      assertEqual(c.status, 201, `第 ${seq} 步状态码`);
+      assertEqual(c.body.progress.current_range.sequence, seq + 1, '确认响应携带下一步当前范围');
+    }
+    // 刷新（GET）后：规格、完整范围与当前范围（第 3 步 A 位）均不变
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.wheel_spec, 'heavy', '刷新后规格不变');
+    assertEqual(st.step_ranges.length, 6, '刷新后完整范围六步');
+    assertEqual(st.step_ranges[3].min, 4800, '第 4 步 B 位下限 4800');
+    assertEqual(st.current_range.sequence, 3, '当前范围为第 3 步');
+    assertEqual(st.current_range.position, 'A3', '当前位置 A3');
+    assertEqual(st.current_range.min, 4600, '当前范围下限 4600');
+    assertEqual(st.current_range.max, 5000, '当前范围上限 5000');
+  });
+
+  await t.test('工单码打开携带规格：首次创建按所选规格，重复打开以既有会话为准', async () => {
+    const code = woCode('heavy');
+    const r1 = await fetch(
+      `${base}/api/work-orders/${encodeURIComponent(code)}/session`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wheel_spec: 'heavy' }),
+      },
+    );
+    assertEqual(r1.status, 201, '首次打开创建状态码');
+    const s1 = await r1.json();
+    assertEqual(s1.wheel_spec, 'heavy', '首次创建按所选重载型');
+    assertEqual(s1.step_ranges[0].min, 4600, '快照为重载型范围');
+    // 重复打开（即使不带规格或带其他规格）返回既有会话，规格不变
+    const r2 = await openWorkOrder(base, code);
+    assertEqual(r2.status, 200, '重复打开返回既有会话');
+    assertEqual(r2.body.session_id, s1.session_id, '同一会话');
+    assertEqual(r2.body.wheel_spec, 'heavy', '既有会话规格保持重载型');
+  });
+
+  await t.test('历史会话迁移后按原 4200–4800 规则解释（数据库默认回填）', async () => {
+    // 直接以数据库默认值插入一行（等价于迁移对历史行的回填结果）：
+    // wheel_spec 默认 standard、step_ranges 默认标准型六步快照
+    const client = new pg.Client({
+      connectionString: process.env.DATABASE_URL || 'postgres://hub:hub@db:5432/hub_review',
+    });
+    await client.connect();
+    let sid;
+    try {
+      const { rows } = await client.query(
+        'INSERT INTO sessions DEFAULT VALUES RETURNING id, wheel_spec',
+      );
+      sid = rows[0].id;
+      assertEqual(rows[0].wheel_spec, 'standard', '回填规格为标准型');
+      const { rows: chk } = await client.query(
+        `SELECT jsonb_array_length(step_ranges) AS n,
+                bool_and((r->>'min')::int = 4200 AND (r->>'max')::int = 4800) AS orig
+         FROM sessions, LATERAL jsonb_array_elements(step_ranges) r
+         WHERE id = $1 GROUP BY step_ranges`,
+        [sid],
+      );
+      assertEqual(chk[0].n, 6, '回填快照六步');
+      assertEqual(chk[0].orig, true, '回填快照为原 4200–4800 规则');
+      // 全库不存在未回填快照的会话
+      const { rows: missing } = await client.query(
+        'SELECT count(*)::int AS n FROM sessions WHERE step_ranges IS NULL OR wheel_spec IS NULL',
+      );
+      assertEqual(missing[0].n, 0, '所有会话均已回填规格与快照');
+    } finally {
+      await client.end();
+    }
+    // 该会话走 API：边界 4200/4800 合格，4199/4801 拒绝（原规则）
+    const st = await getSession(base, sid);
+    assertEqual(st.wheel_spec, 'standard', '查询返回标准型');
+    assertEqual(st.current_range.min, 4200, '当前范围下限 4200');
+    const low = await postConf(base, sid, {
+      sequence: 1, position: 'A1', torque: 4199, idempotency_key: key('mig-low'),
+    });
+    assertEqual(low.status, 422, '4199 仍被拒绝');
+    const ok = await postConf(base, sid, {
+      sequence: 1, position: 'A1', torque: 4200, idempotency_key: key('mig-ok'),
+    });
+    assertEqual(ok.status, 201, '4200 边界合格');
+    const high = await postConf(base, sid, {
+      sequence: 2, position: 'B2', torque: 4801, idempotency_key: key('mig-high'),
+    });
+    assertEqual(high.status, 422, '4801 仍被拒绝');
+  });
 }

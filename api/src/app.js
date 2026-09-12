@@ -4,8 +4,9 @@ import { pool } from './db.js';
 import {
   POSITIONS,
   TOTAL_STEPS,
-  TORQUE_MIN,
-  TORQUE_MAX,
+  WHEEL_SPECS,
+  DEFAULT_WHEEL_SPEC,
+  stepRangesFor,
   IDEMPOTENCY_KEY_MAX_LENGTH,
   CANCEL_REASON_MIN_LENGTH,
   CANCEL_REASON_MAX_LENGTH,
@@ -55,6 +56,37 @@ function normalizeWorkOrderCode(raw) {
     );
   }
   return code;
+}
+
+/**
+ * 规范化轮毂规格：缺省（未传）为标准型，保持旧客户端语义；
+ * 未知规格抛 400 unknown_wheel_spec，message 为可直接展示的中文原因。
+ */
+function normalizeWheelSpec(raw) {
+  if (raw === undefined || raw === null) {
+    return DEFAULT_WHEEL_SPEC;
+  }
+  if (typeof raw !== 'string' || !WHEEL_SPECS.includes(raw)) {
+    throw new ApiError(
+      400,
+      'unknown_wheel_spec',
+      `未知轮毂规格：${JSON.stringify(raw)}，可选 ${WHEEL_SPECS.join(' / ')}（标准型 / 重载型）`,
+    );
+  }
+  return raw;
+}
+
+/** 会话固化的六步范围快照；历史数据迁移后必有，异常时回退标准规则兜底。 */
+function stepRangesOf(session) {
+  return Array.isArray(session.step_ranges) && session.step_ranges.length === TOTAL_STEPS
+    ? session.step_ranges
+    : stepRangesFor(DEFAULT_WHEEL_SPEC);
+}
+
+/** 当前期待步骤的合格范围；会话已结束（完成/终止）时为 null。 */
+function currentRangeOf(session) {
+  if (session.status !== 'in_progress') return null;
+  return stepRangesOf(session)[session.expected_sequence - 1] ?? null;
 }
 
 function confirmationView(row) {
@@ -124,6 +156,8 @@ function progressOf(session) {
     confirmed_count: session.expected_sequence - 1,
     expected_sequence: finished ? null : session.expected_sequence,
     expected_position: finished ? null : POSITIONS[session.expected_sequence - 1],
+    // 当前步骤的合格范围（按会话快照）；会话结束后为 null
+    current_range: currentRangeOf(session),
   };
   // 终止信息仅在已终止会话上出现，进行中/已完成响应保持原格式不变
   if (session.status === 'cancelled') {
@@ -134,12 +168,21 @@ function progressOf(session) {
 }
 
 function sessionView(session, confirmations, retractions = []) {
+  const stepRanges = stepRangesOf(session);
   return {
     session_id: session.id,
     work_order_code: session.work_order_code ?? null,
+    // 轮毂规格与创建时固化的六步范围快照（完整范围）
+    wheel_spec: session.wheel_spec ?? DEFAULT_WHEEL_SPEC,
+    step_ranges: stepRanges,
     created_at: session.created_at,
     positions: POSITIONS,
-    torque_range: { min: TORQUE_MIN, max: TORQUE_MAX, unit: 'cN·m' },
+    // 既有字段：全部步骤范围的包络（标准型即原 4200–4800）
+    torque_range: {
+      min: Math.min(...stepRanges.map((r) => r.min)),
+      max: Math.max(...stepRanges.map((r) => r.max)),
+      unit: 'cN·m',
+    },
     input_units: INPUT_UNITS,
     default_unit: DEFAULT_UNIT,
     nm_max_decimals: NM_MAX_DECIMALS,
@@ -150,23 +193,24 @@ function sessionView(session, confirmations, retractions = []) {
   };
 }
 
-/** 由会话行取出会话视图所需字段（含工单码）。 */
+/** 由会话行取出会话视图所需字段（含工单码、规格与范围快照）。 */
 const SESSION_FIELDS =
-  'id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at';
+  'id, status, expected_sequence, work_order_code, wheel_spec, step_ranges, cancel_reason, cancelled_at, created_at';
 
 /**
  * 在事务内按工单码读取或创建会话：已绑定则返回原会话（200），
- * 未绑定则创建并绑定（201）。
+ * 未绑定则按所给规格创建并绑定（201，规格快照在创建时固化）。
  *
  * 并发首次打开由唯一约束保证只会产生一行：INSERT 使用
  * ON CONFLICT DO NOTHING，冲突者等待赢家提交后得到 0 行，再行锁读取该会话。
  */
-async function openWorkOrderSession(client, code) {
+async function openWorkOrderSession(client, code, spec) {
   const inserted = await client.query(
-    `INSERT INTO sessions (work_order_code) VALUES ($1)
+    `INSERT INTO sessions (work_order_code, wheel_spec, step_ranges)
+     VALUES ($1, $2, $3::jsonb)
      ON CONFLICT (work_order_code) DO NOTHING
      RETURNING ${SESSION_FIELDS}`,
-    [code],
+    [code, spec, JSON.stringify(stepRangesFor(spec))],
   );
   if (inserted.rowCount > 0) {
     return { created: true, session: inserted.rows[0] };
@@ -302,12 +346,16 @@ export function createApp() {
     }
   });
 
-  // 开始新会话：固定 A1 → B2 → A3 → B1 → A2 → B3
+  // 开始新会话：固定 A1 → B2 → A3 → B1 → A2 → B3。
+  // 可选请求体 { wheel_spec }：缺省标准型（空请求体语义不变），重载型按 A/B 位差异范围；
+  // 六步合格范围在创建时固化为快照随会话持久化。
   app.post('/api/sessions', async (req, res, next) => {
     try {
+      const spec = normalizeWheelSpec((req.body ?? {}).wheel_spec);
       const { rows } = await pool.query(
-        `INSERT INTO sessions DEFAULT VALUES
-         RETURNING id, status, expected_sequence, created_at`,
+        `INSERT INTO sessions (wheel_spec, step_ranges) VALUES ($1, $2::jsonb)
+         RETURNING id, status, expected_sequence, wheel_spec, step_ranges, created_at`,
+        [spec, JSON.stringify(stepRangesFor(spec))],
       );
       res.status(201).json(sessionView(rows[0], [], []));
     } catch (err) {
@@ -316,18 +364,21 @@ export function createApp() {
   });
 
   // 按工单码打开复核：已绑定则在同一事务内返回该会话，尚未绑定时才创建。
+  // 可选请求体 { wheel_spec } 仅在首次创建时生效；已绑定会话以其固化规格为准。
   // 两个终端并发打开同一码只会得到同一会话（ON CONFLICT DO NOTHING + 行锁改读）。
   app.post('/api/work-orders/:code/session', async (req, res, next) => {
     let code;
+    let spec;
     try {
       code = normalizeWorkOrderCode(req.params.code ?? '');
+      spec = normalizeWheelSpec((req.body ?? {}).wheel_spec);
     } catch (err) {
       return next(err);
     }
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const { created, session } = await openWorkOrderSession(client, code);
+      const { created, session } = await openWorkOrderSession(client, code, spec);
       const c = await client.query(ACTIVE_CONFIRMATIONS_SQL, [session.id]);
       const rs = await client.query(RETRACTIONS_SQL, [session.id]);
       await client.query('COMMIT');
@@ -701,13 +752,15 @@ export function createApp() {
         );
       }
 
-      // 4) 扭矩须在合格范围内（含边界），判定一律使用换算后的标准 cN·m
-      if (torque < TORQUE_MIN || torque > TORQUE_MAX) {
+      // 4) 扭矩须在合格范围内（含边界）：按会话创建时固化的当前步骤快照判定，
+      //    一律使用换算后的标准 cN·m；重载型 A/B 位范围不同
+      const range = stepRangesOf(session)[sequence - 1];
+      if (torque < range.min || torque > range.max) {
         const reading = `${torqueInput} ${unit}`;
         throw new ApiError(
           422,
           'torque_out_of_range',
-          `扭矩 ${reading}（${torque} cN·m）超出合格范围 ${TORQUE_MIN}–${TORQUE_MAX} cN·m，未推进`,
+          `扭矩 ${reading}（${torque} cN·m）超出第 ${sequence} 步（${requiredPosition}）合格范围 ${range.min}–${range.max} cN·m，未推进`,
           { progress },
         );
       }
