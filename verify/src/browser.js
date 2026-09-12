@@ -4,16 +4,42 @@ import { assert, assertEqual } from './helpers.js';
 
 const POSITIONS = ['A1', 'B2', 'A3', 'B1', 'A2', 'B3'];
 
+let woSeq = 0;
+const newCode = (tag) => `WO-${tag}-${process.pid}-${Date.now()}-${(woSeq += 1)}`;
+
 /** 页面测试：用真实 Chromium 驱动工位页面。 */
 export async function runBrowser(webBase, apiBase, t) {
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
 
-  async function newSessionPage() {
-    const page = await browser.newPage();
+  // 每个用例使用独立 BrowserContext：localStorage 互不影响，
+  // 等价于另一台触屏 / 清理过浏览器的终端。
+  async function freshPage() {
+    const context = await browser.newContext();
+    const page = await context.newPage();
     page.setDefaultTimeout(20000);
     await page.goto(`${webBase}/`);
+    return page;
+  }
+
+  async function closePage(page) {
+    await page.context().close();
+  }
+
+  // 旧客户端流程：无请求体创建（开始无码新会话）
+  async function newSessionPage() {
+    const page = await freshPage();
+    await page.waitForSelector('#entry-panel:not([hidden])');
     await page.click('#btn-new');
     await page.waitForSelector('#work-panel:not([hidden])');
+    return page;
+  }
+
+  // 工单码进入：输入或扫码后点击「打开复核」
+  async function openByWorkOrder(code) {
+    const page = await freshPage();
+    await page.waitForSelector('#entry-panel:not([hidden])');
+    await page.fill('#workorder-input', code);
+    await page.click('#btn-open');
     return page;
   }
 
@@ -35,8 +61,179 @@ export async function runBrowser(webBase, apiBase, t) {
   }
 
   try {
-    await t.test('页面依次完成六颗螺栓并显示「轮毂复核完成」', async () => {
+    await t.test('新工单首次打开：从第一颗螺栓开始并显示工单码', async () => {
+      const code = newCode('first');
+      const page = await openByWorkOrder(code);
+      await page.waitForSelector('#work-panel:not([hidden])');
+      assertEqual(await currentPosition(page), 'A1', '应从 A1 开始');
+      const shown = await page.textContent('#workorder-code');
+      assert(shown.includes(code), `顶栏应显示工单码 ${code}`);
+      assertEqual(await page.locator('#bolt-list li.done').count(), 0, '没有已确认螺栓');
+      const st = await serverState(page);
+      assertEqual(st.work_order_code, code, '服务端会话应绑定该工单码');
+      assertEqual(st.status, 'in_progress', '服务端为进行中');
+      await closePage(page);
+    });
+
+    await t.test('完成两步后在另一浏览器输入同一工单码：接续第三颗', async () => {
+      const code = newCode('resume');
+
+      // 终端一：打开工单，完成前两颗
+      const p1 = await openByWorkOrder(code);
+      await p1.waitForSelector('#work-panel:not([hidden])');
+      await confirmCurrent(p1, 4500);
+      await p1.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      await confirmCurrent(p1, 4600);
+      await p1.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+
+      // 终端二：独立浏览器上下文（等同换触屏/清理浏览器），手输同一工单码
+      const p2 = await freshPage();
+      await p2.waitForSelector('#entry-panel:not([hidden])');
+      await p2.fill('#workorder-input', code);
+      await p2.click('#btn-open');
+      await p2.waitForSelector('#work-panel:not([hidden])');
+      assertEqual(await currentPosition(p2), 'A3', '另一浏览器应接续到第三颗 A3');
+      assertEqual(await p2.locator('#bolt-list li.done').count(), 2, '应显示两颗已完成');
+      assert(p2 !== p1, '两个终端为独立页面');
+
+      const id1 = await p1.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      const id2 = await p2.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      assertEqual(id2, id1, '两个终端进入的是同一个服务端会话');
+
+      // 终端二直接在第三颗继续，六步全部完成
+      for (let i = 2; i < 6; i += 1) {
+        await p2.waitForFunction(
+          (pos) => document.getElementById('current-position').textContent.trim() === pos,
+          POSITIONS[i],
+        );
+        await confirmCurrent(p2, 4500);
+      }
+      await p2.waitForSelector('#done-banner:not([hidden])');
+
+      // 终端一刷新后同样读到服务端权威完成态
+      await p1.reload();
+      await p1.waitForSelector('#done-banner:not([hidden])');
+      const st = await serverState(p2);
+      assertEqual(st.status, 'completed', '服务端为完成态');
+      assertEqual(st.confirmations.length, 6, '六颗螺栓全部确认');
+
+      await closePage(p1);
+      await closePage(p2);
+    });
+
+    await t.test('一个终端终止工单后，另一终端按同一码恢复终止信息并保持提交关闭', async () => {
+      const code = newCode('cancelled-resume');
+      const reason = '跨终端恢复终止工单';
+      const p1 = await openByWorkOrder(code);
+      await p1.waitForSelector('#work-panel:not([hidden])');
+      await p1.click('#btn-cancel-open');
+      await p1.waitForSelector('#cancel-panel:not([hidden])');
+      await p1.fill('#cancel-reason', reason);
+      await p1.click('#btn-cancel-confirm');
+      await p1.waitForSelector('#cancelled-banner:not([hidden])');
+      const sid1 = await p1.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      await closePage(p1);
+
+      const p2 = await openByWorkOrder(code);
+      await p2.waitForSelector('#cancelled-banner:not([hidden])');
+      const sid2 = await p2.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      assertEqual(sid2, sid1, '另一终端恢复同一服务端会话');
+      const banner = await p2.textContent('#cancelled-banner');
+      assert(banner.includes(reason), '另一终端展示原终止原因');
+      assert(/\d{4}\/\d{1,2}\/\d{1,2}/.test(banner), '另一终端展示终止时间');
+      assert(await p2.isHidden('#work-panel'), '终止态不显示扭矩提交面板');
+      const st = await serverState(p2);
+      assertEqual(st.work_order_code, code, '工单码保持不变');
+      assertEqual(st.status, 'cancelled', '服务端保持终止态');
+      await closePage(p2);
+    });
+
+    await t.test('两个终端并发首次打开同一工单码：只得到同一会话', async () => {
+      const code = newCode('race');
+      const [p1, p2] = await Promise.all([freshPage(), freshPage()]);
+      await Promise.all([
+        p1.waitForSelector('#entry-panel:not([hidden])'),
+        p2.waitForSelector('#entry-panel:not([hidden])'),
+      ]);
+      await p1.fill('#workorder-input', code);
+      await p2.fill('#workorder-input', code);
+      // 同时点击，制造并发首次打开
+      await Promise.all([p1.click('#btn-open'), p2.click('#btn-open')]);
+      await Promise.all([
+        p1.waitForSelector('#work-panel:not([hidden])'),
+        p2.waitForSelector('#work-panel:not([hidden])'),
+      ]);
+      const id1 = await p1.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      const id2 = await p2.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      assertEqual(id1, id2, '并发打开必须得到同一个会话');
+      assertEqual(await currentPosition(p1), 'A1', '终端一在第一颗');
+      assertEqual(await currentPosition(p2), 'A1', '终端二在第一颗');
+      const st = await serverState(p1);
+      assertEqual(st.confirmations.length, 0, '新会话没有确认记录');
+      await closePage(p1);
+      await closePage(p2);
+    });
+
+    await t.test('工单码非法时停留在进入区并显示原因', async () => {
+      const page = await freshPage();
+      await page.waitForSelector('#entry-panel:not([hidden])');
+
+      await page.fill('#workorder-input', '   ');
+      await page.click('#btn-open');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('工单码'));
+      assert(await page.isVisible('#entry-panel'), '仍停留在进入区');
+      assert(await page.isHidden('#work-panel'), '不应出现复核面板');
+
+      // 超长码由服务端拒绝（>64 字符）
+      await page.fill('#workorder-input', 'X'.repeat(65));
+      await page.click('#btn-open');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('工单码'));
+      assert(await page.isVisible('#entry-panel'), '超长码后仍停留进入区');
+      await closePage(page);
+    });
+
+    await t.test('打开其他工单暂时失败：不覆盖本地已有会话并自动回到原进度', async () => {
+      const code = newCode('keep');
+      const page = await openByWorkOrder(code);
+      await page.waitForSelector('#work-panel:not([hidden])');
+      await confirmCurrent(page, 4500);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      const sidBefore = await page.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+
+      // 回到进入区尝试打开另一个工单，但该请求网络失败
+      await page.click('#btn-switch');
+      await page.waitForSelector('#entry-panel:not([hidden])');
+      await page.route('**/api/work-orders/*/session', (route) => route.abort());
+      await page.fill('#workorder-input', newCode('unreachable'));
+      await page.click('#btn-open');
+      await page.waitForSelector('#work-panel:not([hidden])');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('原来的复核会话'));
+      assertEqual(await currentPosition(page), 'B2', '失败后仍停在原会话的第二颗');
+      const sidAfter = await page.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      assertEqual(sidAfter, sidBefore, '本地会话编号未被覆盖');
+      const st = await serverState(page);
+      assertEqual(st.work_order_code, code, '仍是原工单码会话');
+
+      // 解除拦截后，输入原工单码仍可接续
+      await page.unroute('**/api/work-orders/*/session');
+      await page.click('#btn-switch');
+      await page.waitForSelector('#entry-panel:not([hidden])');
+      await page.fill('#workorder-input', code);
+      await page.click('#btn-open');
+      await page.waitForSelector('#work-panel:not([hidden])');
+      assertEqual(await currentPosition(page), 'B2', '重新打开原工单码接续到 B2');
+      await closePage(page);
+    });
+
+    await t.test('页面依次完成六颗螺栓并显示「轮毂复核完成」（无码旧流程）', async () => {
       const page = await newSessionPage();
+      assertEqual((await page.textContent('#workorder-code')).trim(), '—', '无码会话不显示工单码');
       for (let i = 0; i < 6; i += 1) {
         assertEqual(await currentPosition(page), POSITIONS[i], `第 ${i + 1} 步应复核 ${POSITIONS[i]}`);
         await confirmCurrent(page, 4500);
@@ -53,7 +250,8 @@ export async function runBrowser(webBase, apiBase, t) {
       assertEqual(await page.locator('#confirm-table tbody tr').count(), 6, '应列出六条确认');
       const st = await serverState(page);
       assertEqual(st.status, 'completed', '服务端状态应为完成');
-      await page.close();
+      assertEqual(st.work_order_code, null, '旧流程会话无工单码');
+      await closePage(page);
     });
 
     await t.test('越界扭矩被页面拒绝：显示原因并停留在当前螺栓', async () => {
@@ -68,7 +266,7 @@ export async function runBrowser(webBase, apiBase, t) {
       assertEqual(await currentPosition(page), 'A1', '再次拒绝后仍停留在 A1');
       const st = await serverState(page);
       assertEqual(st.confirmations.length, 0, '服务端无确认记录');
-      await page.close();
+      await closePage(page);
     });
 
     await t.test('刷新页面后从服务端恢复权威进度', async () => {
@@ -86,7 +284,7 @@ export async function runBrowser(webBase, apiBase, t) {
         () => document.getElementById('current-position').textContent.trim() === 'A3',
       );
       assertEqual(await page.locator('#bolt-list li.done').count(), 2, '应有两颗已确认');
-      await page.close();
+      await closePage(page);
     });
 
     await t.test('网络中断时页面以同一幂等键自动重试，服务端不重复记录', async () => {
@@ -109,7 +307,7 @@ export async function runBrowser(webBase, apiBase, t) {
       assertEqual(aborted, 2, '应发生了两次网络中断重试');
       const st = await serverState(page);
       assertEqual(st.confirmations.length, 1, '重试不产生重复确认');
-      await page.close();
+      await closePage(page);
     });
 
     await t.test('响应缓慢时触屏连点只记录一次确认', async () => {
@@ -128,7 +326,7 @@ export async function runBrowser(webBase, apiBase, t) {
       const st = await serverState(page);
       assertEqual(st.confirmations.length, 1, '连点只落库一次');
       assert(st1.confirmations.length <= 1, '提交中不应出现重复记录');
-      await page.close();
+      await closePage(page);
     });
 
     await t.test('完成后刷新仍显示完成状态，且不再出现提交表单', async () => {
@@ -150,7 +348,7 @@ export async function runBrowser(webBase, apiBase, t) {
       await page.reload();
       await page.waitForSelector('#done-banner:not([hidden])');
       assert(await page.isHidden('#work-panel'), '完成后不应再显示提交表单');
-      await page.close();
+      await closePage(page);
     });
 
     await t.test('完成两步后页面终止复核：展示原因与时间、关闭扭矩提交、刷新后保持', async () => {

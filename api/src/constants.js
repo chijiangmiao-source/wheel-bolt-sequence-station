@@ -11,3 +11,7 @@ export const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 // 终止复核原因长度（按字符计），2–100 字
 export const CANCEL_REASON_MIN_LENGTH = 2;
 export const CANCEL_REASON_MAX_LENGTH = 100;
+
+// 工单码长度（去除首尾空白后计），扫码/手输共用
+export const WORK_ORDER_CODE_MIN_LENGTH = 1;
+export const WORK_ORDER_CODE_MAX_LENGTH = 64;

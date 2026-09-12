@@ -9,6 +9,8 @@ import {
   IDEMPOTENCY_KEY_MAX_LENGTH,
   CANCEL_REASON_MIN_LENGTH,
   CANCEL_REASON_MAX_LENGTH,
+  WORK_ORDER_CODE_MIN_LENGTH,
+  WORK_ORDER_CODE_MAX_LENGTH,
 } from './constants.js';
 
 const UUID_RE =
@@ -22,6 +24,28 @@ class ApiError extends Error {
     this.code = code;
     this.extra = extra;
   }
+}
+
+/**
+ * 规范化工单码：去除首尾空白。非法时抛 400 invalid_work_order_code，
+ * message 为可直接展示的中文原因。
+ */
+function normalizeWorkOrderCode(raw) {
+  if (typeof raw !== 'string') {
+    throw new ApiError(400, 'invalid_work_order_code', '工单码必须为字符串');
+  }
+  const code = raw.trim();
+  if (code.length < WORK_ORDER_CODE_MIN_LENGTH) {
+    throw new ApiError(400, 'invalid_work_order_code', '工单码不能为空');
+  }
+  if (code.length > WORK_ORDER_CODE_MAX_LENGTH) {
+    throw new ApiError(
+      400,
+      'invalid_work_order_code',
+      `工单码长度不能超过 ${WORK_ORDER_CODE_MAX_LENGTH} 个字符`,
+    );
+  }
+  return code;
 }
 
 function confirmationView(row) {
@@ -56,12 +80,46 @@ function progressOf(session) {
 function sessionView(session, confirmations) {
   return {
     session_id: session.id,
+    work_order_code: session.work_order_code ?? null,
     created_at: session.created_at,
     positions: POSITIONS,
     torque_range: { min: TORQUE_MIN, max: TORQUE_MAX, unit: 'cN·m' },
     ...progressOf(session),
     confirmations: confirmations.map(confirmationView),
   };
+}
+
+/** 由会话行取出会话视图所需字段（含工单码）。 */
+const SESSION_FIELDS =
+  'id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at';
+
+/**
+ * 在事务内按工单码读取或创建会话：已绑定则返回原会话（200），
+ * 未绑定则创建并绑定（201）。
+ *
+ * 并发首次打开由唯一约束保证只会产生一行：INSERT 使用
+ * ON CONFLICT DO NOTHING，冲突者等待赢家提交后得到 0 行，再行锁读取该会话。
+ */
+async function openWorkOrderSession(client, code) {
+  const inserted = await client.query(
+    `INSERT INTO sessions (work_order_code) VALUES ($1)
+     ON CONFLICT (work_order_code) DO NOTHING
+     RETURNING ${SESSION_FIELDS}`,
+    [code],
+  );
+  if (inserted.rowCount > 0) {
+    return { created: true, session: inserted.rows[0] };
+  }
+  // 唯一约束冲突（含并发赢家刚提交的行）：行锁读取已绑定会话
+  const existing = await client.query(
+    `SELECT ${SESSION_FIELDS} FROM sessions WHERE work_order_code = $1 FOR UPDATE`,
+    [code],
+  );
+  if (existing.rowCount === 0) {
+    // 理论不可达：冲突必然来自已存在的工单码行
+    throw new Error('工单码会话在冲突后消失');
+  }
+  return { created: false, session: existing.rows[0] };
 }
 
 export function createApp() {
@@ -96,6 +154,33 @@ export function createApp() {
       res.status(201).json(sessionView(rows[0], []));
     } catch (err) {
       next(err);
+    }
+  });
+
+  // 按工单码打开复核：已绑定则在同一事务内返回该会话，尚未绑定时才创建。
+  // 两个终端并发打开同一码只会得到同一会话（ON CONFLICT DO NOTHING + 行锁改读）。
+  app.post('/api/work-orders/:code/session', async (req, res, next) => {
+    let code;
+    try {
+      code = normalizeWorkOrderCode(req.params.code ?? '');
+    } catch (err) {
+      return next(err);
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { created, session } = await openWorkOrderSession(client, code);
+      const c = await client.query(
+        'SELECT * FROM confirmations WHERE session_id = $1 ORDER BY sequence',
+        [session.id],
+      );
+      await client.query('COMMIT');
+      res.status(created ? 201 : 200).json(sessionView(session, c.rows));
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      next(err);
+    } finally {
+      client.release();
     }
   });
 

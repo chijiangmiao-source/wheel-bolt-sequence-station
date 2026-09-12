@@ -19,6 +19,17 @@ async function getSession(base, id) {
   return r.json();
 }
 
+let woSeq = 0;
+const woCode = (tag) => `WO-${tag}-${process.pid}-${Date.now()}-${(woSeq += 1)}`;
+
+async function openWorkOrder(base, code) {
+  const r = await fetch(
+    `${base}/api/work-orders/${encodeURIComponent(code)}/session`,
+    { method: 'POST' },
+  );
+  return { status: r.status, body: await r.json() };
+}
+
 async function postConf(base, sid, payload) {
   const r = await fetch(`${base}/api/sessions/${sid}/confirmations`, {
     method: 'POST',
@@ -357,5 +368,136 @@ export async function runProtocol(base, t) {
       assertEqual(conf.body.progress.status, 'cancelled', '后到确认收到已终止进度');
       assertEqual(st.confirmations.length, 5, '终止态保持五条确认');
     }
+  });
+  await t.test('工单码：首次打开从第一颗开始，重复打开返回同一会话（含首尾空白归一化）', async () => {
+    const code = woCode('first');
+    const r1 = await openWorkOrder(base, code);
+    assertEqual(r1.status, 201, '首次打开应为 201');
+    assertEqual(r1.body.work_order_code, code, '回显工单码');
+    assertEqual(r1.body.expected_sequence, 1, '新工单从第一颗开始');
+    assertEqual(r1.body.expected_position, 'A1', '新工单初始位置为 A1');
+    assertEqual(r1.body.confirmed_count, 0, '新工单无确认记录');
+
+    const r2 = await openWorkOrder(base, code);
+    assertEqual(r2.status, 200, '再次打开应为 200');
+    assertEqual(r2.body.session_id, r1.body.session_id, '应返回已绑定的同一会话');
+    assertEqual(r2.body.work_order_code, code, '工单码保持不变');
+
+    // 接口按去除首尾空白后的值保存与查找：带空白的同码仍命中同一会话
+    const r3 = await openWorkOrder(base, `  ${code}  `);
+    assertEqual(r3.status, 200, '带首尾空白打开应为 200');
+    assertEqual(r3.body.session_id, r1.body.session_id, '空白归一化后应命中同一会话');
+  });
+
+  await t.test('工单码：完成两步后再次打开，接续到第三颗且带有权威进度', async () => {
+    const code = woCode('resume');
+    const opened = await openWorkOrder(base, code);
+    assertEqual(opened.status, 201);
+    const sid = opened.body.session_id;
+    for (const [seq, pos, torque] of [[1, 'A1', 4500], [2, 'B2', 4600]]) {
+      const r = await postConf(base, sid, {
+        sequence: seq, position: pos, torque, idempotency_key: key(`wo-resume-${seq}`),
+      });
+      assertEqual(r.status, 201, `第 ${seq} 步应成功`);
+    }
+    const again = await openWorkOrder(base, code);
+    assertEqual(again.status, 200);
+    assertEqual(again.body.session_id, sid, '仍为同一会话');
+    assertEqual(again.body.confirmed_count, 2, '已确认两颗');
+    assertEqual(again.body.expected_sequence, 3, '接续第三颗');
+    assertEqual(again.body.expected_position, 'A3', '第三颗位置为 A3');
+    assertEqual(again.body.confirmations.length, 2, '返回两条历史确认');
+  });
+
+  await t.test('工单码会话终止后再次打开：恢复同一终止态、原因与时间', async () => {
+    const code = woCode('cancelled-resume');
+    const opened = await openWorkOrder(base, code);
+    const sid = opened.body.session_id;
+    await confirmSteps(base, sid, 2);
+    const cancelled = await postCancel(base, sid, '跨终端终止后恢复');
+    assertEqual(cancelled.status, 200, '终止应成功');
+
+    const again = await openWorkOrder(base, code);
+    assertEqual(again.status, 200, '再次打开应复用现有会话');
+    assertEqual(again.body.session_id, sid, '恢复同一会话');
+    assertEqual(again.body.status, 'cancelled', '恢复终止态');
+    assertEqual(again.body.cancel_reason, '跨终端终止后恢复', '恢复终止原因');
+    assert(Boolean(again.body.cancelled_at), '恢复终止时间');
+    assertEqual(again.body.confirmed_count, 2, '保留终止前进度');
+    assertEqual(again.body.expected_sequence, null, '终止态不再期待下一步');
+  });
+
+  await t.test('工单码：并发首次打开同一码只产生一个会话', async () => {
+    const code = woCode('race');
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => openWorkOrder(base, code)),
+    );
+    const created = results.filter((r) => r.status === 201);
+    const reused = results.filter((r) => r.status === 200);
+    assertEqual(created.length, 1, '只有一个请求创建会话');
+    assertEqual(reused.length, 7, '其余请求复用该会话');
+    const ids = new Set(results.map((r) => r.body.session_id));
+    assertEqual(ids.size, 1, '所有响应必须是同一个会话编号');
+    assertEqual([...ids][0], created[0].body.session_id, '复用的正是被创建的会话');
+
+    // 数据库层兜底：该工单码只绑定一行会话
+    const client = new pg.Client({
+      connectionString: process.env.DATABASE_URL || 'postgres://hub:hub@db:5432/hub_review',
+    });
+    await client.connect();
+    try {
+      const { rows } = await client.query(
+        'SELECT count(*)::int AS n FROM sessions WHERE work_order_code = $1',
+        [code],
+      );
+      assertEqual(rows[0].n, 1, '数据库中该工单码只有一个会话');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await t.test('工单码：空白码与超长码返回 400 invalid_work_order_code 且不创建会话', async () => {
+    const blank = await openWorkOrder(base, '   ');
+    assertEqual(blank.status, 400, '纯空白码状态码');
+    assertEqual(blank.body.error.code, 'invalid_work_order_code', '空白码错误码');
+    const tooLong = await openWorkOrder(base, 'X'.repeat(65));
+    assertEqual(tooLong.status, 400, '超长码状态码');
+    assertEqual(tooLong.body.error.code, 'invalid_work_order_code', '超长码错误码');
+
+    const client = new pg.Client({
+      connectionString: process.env.DATABASE_URL || 'postgres://hub:hub@db:5432/hub_review',
+    });
+    await client.connect();
+    try {
+      // 非法调用不应产生工单码为空或超长的行（历史无码行 work_order_code 为 NULL，不受影响）
+      const { rows: bad } = await client.query(
+        `SELECT count(*)::int AS n FROM sessions
+         WHERE work_order_code IS NOT NULL
+           AND (length(work_order_code) = 0 OR length(work_order_code) > 64)`,
+      );
+      assertEqual(bad[0].n, 0, '不存在非法工单码会话');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await t.test('旧客户端：无请求体创建、按编号读取与六步确认协议继续可用', async () => {
+    const r = await fetch(`${base}/api/sessions`, { method: 'POST' });
+    assertEqual(r.status, 201, '旧创建接口仍为 201');
+    const s = await r.json();
+    assertEqual(s.work_order_code, null, '旧会话无工单码');
+    const got = await getSession(base, s.session_id);
+    assertEqual(got.expected_sequence, 1, '按编号读取初始进度');
+    for (let i = 0; i < 6; i += 1) {
+      const c = await postConf(base, s.session_id, {
+        sequence: i + 1,
+        position: POSITIONS[i],
+        torque: 4500,
+        idempotency_key: key(`legacy-${i}`),
+      });
+      assertEqual(c.status, 201, `旧协议第 ${i + 1} 步状态码`);
+    }
+    const done = await getSession(base, s.session_id);
+    assertEqual(done.status, 'completed', '旧会话六步后完成');
   });
 }

@@ -9,6 +9,9 @@ CREATE TABLE sessions (
   -- 下一个期待的序号（从 1 开始）；六步全部确认后为 7，仅服务端可推进
   expected_sequence INTEGER NOT NULL DEFAULT 1
                     CHECK (expected_sequence BETWEEN 1 AND 7),
+  -- 可选工单码：非空值全表唯一（NULL 互不冲突，历史无码会话无需补值）。
+  -- 同一工单码的并发首次打开由该唯一约束兜底，只会绑定一个会话。
+  work_order_code   TEXT,
   -- 终止原因与终止时间：仅 status = 'cancelled' 时非空，长度 2–100 字
   cancel_reason     TEXT,
   cancelled_at      TIMESTAMPTZ,
@@ -20,7 +23,8 @@ CREATE TABLE sessions (
       AND cancelled_at IS NOT NULL)
     OR
     (status <> 'cancelled' AND cancel_reason IS NULL AND cancelled_at IS NULL)
-  )
+  ),
+  CONSTRAINT sessions_work_order_code_uniq UNIQUE (work_order_code)
 );
 
 CREATE TABLE confirmations (

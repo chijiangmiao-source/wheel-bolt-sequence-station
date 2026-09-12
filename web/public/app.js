@@ -3,6 +3,12 @@
 /*
  * 轮毂复核工位页面逻辑。
  *
+ * 进入方式：
+ * - 按工单码「打开复核」：POST /api/work-orders/{code}/session，
+ *   已绑定则接续原会话，未绑定则从第一颗开始新建；刷新、换浏览器、换触屏后
+ *   都以服务端返回的权威进度为准。
+ * - 旧的「开始无码新会话」：POST /api/sessions，协议保持不变。
+ *
  * 重试语义（与 README 一致）：
  * - 每次“用户提交意图”生成一个幂等键；网络异常导致的自动重试复用同一键，
  *   服务端据此去重：同键同载荷返回原确认，同键不同载荷判定冲突。
@@ -12,6 +18,7 @@
  */
 
 const SESSION_KEY = 'hub_review.session_id';
+const WORK_ORDER_KEY = 'hub_review.work_order_code';
 const REQUEST_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 6; // 首次 + 5 次自动重试（同一幂等键）
 
@@ -19,11 +26,16 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   sessionId: localStorage.getItem(SESSION_KEY),
+  workOrderCode: localStorage.getItem(WORK_ORDER_KEY),
   view: null, // 服务端权威进度
   busy: false, // 是否有提交在途（含自动重试）
   cancelFormOpen: false, // 是否打开了终止原因填写面板
   cancelling: false, // 终止请求是否在途
+  opening: false, // 是否有「打开复核 / 开始会话」请求在途
 };
+
+// 「打开其他工单」时暂存的本地现场：新工单打开失败则恢复原会话
+let suspended = null;
 
 function uuid() {
   if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -58,6 +70,56 @@ async function fetchJson(path, options) {
   return { status: res.status, body };
 }
 
+/** 进入一个会话视图：记录会话与工单码并渲染。 */
+function adoptSession(body, notice) {
+  suspended = null;
+  state.sessionId = body.session_id;
+  state.workOrderCode = body.work_order_code ?? null;
+  state.view = body;
+  state.cancelFormOpen = false;
+  localStorage.setItem(SESSION_KEY, state.sessionId);
+  if (state.workOrderCode) {
+    localStorage.setItem(WORK_ORDER_KEY, state.workOrderCode);
+  } else {
+    localStorage.removeItem(WORK_ORDER_KEY);
+  }
+  $('torque-input').value = '';
+  if (notice) showNotice(notice);
+}
+
+/** 回到进入区：暂存本地现场但不清服务端会话；新工单打开失败可恢复，输同一码也可接续。 */
+function backToEntry(notice) {
+  if (state.view) {
+    suspended = {
+      sessionId: state.sessionId,
+      workOrderCode: state.workOrderCode,
+      view: state.view,
+    };
+    state.sessionId = null;
+    state.workOrderCode = null;
+    state.view = null;
+    state.cancelFormOpen = false;
+    $('torque-input').value = '';
+    $('workorder-input').value = '';
+  }
+  clearMessages();
+  if (notice) showNotice(notice);
+  render();
+}
+
+/** 新工单打开失败时恢复「打开其他工单」前暂存的本地会话现场。 */
+function restoreSuspended(reason) {
+  if (!suspended) return false;
+  Object.assign(state, {
+    sessionId: suspended.sessionId,
+    workOrderCode: suspended.workOrderCode,
+    view: suspended.view,
+  });
+  suspended = null;
+  showError(`${reason}，已保持在原来的复核会话`);
+  return true;
+}
+
 /** 从服务端重新读取权威进度并渲染。 */
 async function refresh() {
   if (!state.sessionId) {
@@ -69,9 +131,11 @@ async function refresh() {
     const { status, body } = await fetchJson(`/sessions/${state.sessionId}`);
     if (status === 404) {
       localStorage.removeItem(SESSION_KEY);
+      localStorage.removeItem(WORK_ORDER_KEY);
       state.sessionId = null;
+      state.workOrderCode = null;
       state.view = null;
-      showNotice('原会话已不存在，请开始新会话');
+      showNotice('原会话已不存在，请按工单码打开或开始新会话');
     } else if (status === 200) {
       state.view = body;
     } else {
@@ -83,22 +147,80 @@ async function refresh() {
   render();
 }
 
-async function startSession() {
-  if (state.busy) return;
+/** 按工单码打开复核：已绑定接续，未绑定从第一颗新建。失败时不覆盖本地已有会话。 */
+async function openByWorkOrder() {
+  if (state.opening) return;
   clearMessages();
+  const code = $('workorder-input').value.trim();
+  if (code === '') {
+    // 非法工单码：停留在进入区并显示原因
+    showError('工单码不能为空');
+    render();
+    return;
+  }
+
+  state.opening = true;
+  render();
+  try {
+    let status;
+    let body;
+    try {
+      ({ status, body } = await fetchJson(
+        `/work-orders/${encodeURIComponent(code)}/session`,
+        { method: 'POST' },
+      ));
+    } catch {
+      // 查询或创建暂时失败：保留本地已有会话，不覆盖
+      if (restoreSuspended('打开复核失败（网络异常），请稍后重试')) {
+        await refresh(); // 以服务端权威进度对齐恢复后的会话
+      } else {
+        showError('打开复核失败（网络异常），请稍后重试');
+        if (state.view) showNotice('仍显示本地会话的最近进度，请点击「刷新进度」对齐');
+      }
+      return;
+    }
+    if (status === 200) {
+      suspended = null;
+      adoptSession(body, `已按工单码 ${code} 接续已有复核会话`);
+    } else if (status === 201) {
+      suspended = null;
+      adoptSession(body, `已按工单码 ${code} 创建复核会话，请从第一颗螺栓开始`);
+    } else if (status === 400 && body && body.error && body.error.code === 'invalid_work_order_code') {
+      // 工单码非法：停留在进入区并显示原因（不恢复现场，方便改码后重试）
+      showError(`工单码无效：${body.error.message}`);
+    } else {
+      // 其他暂时失败：不覆盖本地已有会话
+      const reason = (body && body.error && body.error.message) || `HTTP ${status}`;
+      if (restoreSuspended(`打开复核暂时失败：${reason}`)) {
+        await refresh();
+      } else {
+        showError(`打开复核暂时失败：${reason}；本地当前会话未被改动`);
+      }
+    }
+  } finally {
+    state.opening = false;
+    render();
+  }
+}
+
+async function startSession() {
+  if (state.opening) return;
+  clearMessages();
+  state.opening = true;
+  render();
   try {
     const { status, body } = await fetchJson('/sessions', { method: 'POST' });
-    if (status !== 201) throw new Error(`HTTP ${status}`);
-    state.sessionId = body.session_id;
-    localStorage.setItem(SESSION_KEY, state.sessionId);
-    state.view = body;
-    state.cancelFormOpen = false;
-    $('torque-input').value = '';
-    showNotice('新会话已开始，请按顺序复核六颗螺栓');
+    if (status !== 201) {
+      showError('创建会话失败，请重试');
+    } else {
+      adoptSession(body, '新会话已开始，请按顺序复核六颗螺栓');
+    }
   } catch {
     showError('创建会话失败，请重试');
+  } finally {
+    state.opening = false;
+    render();
   }
-  render();
 }
 
 /** 提交当前螺栓的复核确认；网络异常时以同一幂等键自动重试。 */
@@ -222,7 +344,12 @@ function render() {
   const view = state.view;
   $('session-id').textContent = state.sessionId ? state.sessionId.slice(0, 8) : '—';
   $('session-id').title = state.sessionId || '';
-  $('start-hint').hidden = Boolean(view);
+  $('workorder-code').textContent = state.workOrderCode || '—';
+  $('workorder-code').title = state.workOrderCode || '';
+
+  // 进入区只在没有会话视图时显示；进入会话后整个复核链路复用原有展示
+  $('entry-panel').hidden = Boolean(view);
+  $('btn-switch').hidden = !view;
 
   const list = $('bolt-list');
   list.textContent = '';
@@ -295,16 +422,72 @@ function render() {
 
   $('btn-submit').disabled = state.busy || !inProgress;
   $('torque-input').disabled = state.busy || !inProgress;
-  $('btn-cancel-open').disabled = state.busy || state.cancelling || !inProgress;
-  $('btn-refresh').disabled = state.busy || state.cancelling;
+  $('btn-cancel-open').disabled = state.busy || state.cancelling || state.opening || !inProgress;
+  $('btn-refresh').disabled = state.busy || state.cancelling || state.opening;
   $('btn-cancel-confirm').disabled = state.cancelling;
   $('btn-cancel-back').disabled = state.cancelling;
+  $('btn-switch').disabled = state.busy || state.cancelling || state.opening;
+  $('btn-open').disabled = state.busy || state.opening;
+  $('btn-new').disabled = state.busy || state.opening;
+  $('workorder-input').disabled = state.busy || state.opening;
+}
+
+/** 启动时恢复：优先按本地工单码向服务端打开权威会话；无码则按旧方式读取会话。 */
+async function restore() {
+  if (state.workOrderCode) {
+    state.opening = true;
+    render();
+    try {
+      let status;
+      let body;
+      try {
+        ({ status, body } = await fetchJson(
+          `/work-orders/${encodeURIComponent(state.workOrderCode)}/session`,
+          { method: 'POST' },
+        ));
+      } catch {
+        // 暂时打不开：若本地还有会话编号，退回按编号读取，不丢失现场
+        if (state.sessionId) {
+          showError('按工单码接续失败（网络异常），已尝试读取本地会话进度');
+          await refresh();
+        } else {
+          showError('无法连接服务器，暂时无法按工单码接续，请稍后重试');
+          render();
+        }
+        return;
+      }
+      if (status === 200 || status === 201) {
+        adoptSession(body);
+      } else if (status === 400 && body && body.error && body.error.code === 'invalid_work_order_code') {
+        // 本地保存的码已不合法：停留在进入区
+        localStorage.removeItem(WORK_ORDER_KEY);
+        state.workOrderCode = null;
+        showError(`本地保存的工单码无效：${body.error.message}，请重新输入`);
+      } else if (state.sessionId) {
+        const reason = (body && body.error && body.error.message) || `HTTP ${status}`;
+        showError(`按工单码接续暂时失败：${reason}，已尝试读取本地会话进度`);
+        await refresh();
+      } else {
+        showError('按工单码接续暂时失败，请稍后重试');
+      }
+    } finally {
+      state.opening = false;
+      render();
+    }
+    return;
+  }
+  await refresh();
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  $('btn-open').addEventListener('click', openByWorkOrder);
   $('btn-new').addEventListener('click', startSession);
+  $('btn-switch').addEventListener('click', () => backToEntry('请输入新的轮毂工单码'));
   $('btn-refresh').addEventListener('click', refresh);
   $('btn-submit').addEventListener('click', submitConfirmation);
+  $('workorder-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') openByWorkOrder();
+  });
   $('torque-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitConfirmation();
   });
@@ -316,5 +499,5 @@ window.addEventListener('DOMContentLoaded', () => {
     $('cancel-reason-hint').textContent =
       len === 0 ? '' : `${len} / 100 字（需 2–100 字）`;
   });
-  refresh();
+  restore();
 });

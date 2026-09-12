@@ -116,6 +116,34 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 
 .hint { color: var(--muted); }
 
+.entry {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 18px 20px;
+  margin: 18px 0 8px;
+  background: #f9fbfd;
+}
+
+.entry h2 { margin: 0 0 6px; font-size: 18px; }
+.entry .hint { margin: 0 0 14px; font-size: 14px; }
+
+.entry-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.entry-alt { color: var(--muted); font-size: 13px; }
+
+#btn-open {
+  background: var(--info);
+  border-color: var(--info);
+  color: #fff;
+  padding: 10px 24px;
+  font-size: 16px;
+}
+#btn-open:hover:not(:disabled) { background: #0a4f92; }
+
 .bolts {
   display: flex;
   flex-wrap: wrap;
