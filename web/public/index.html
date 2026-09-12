@@ -41,8 +41,13 @@
       当前螺栓：<strong id="current-position" class="position"></strong>
       <span class="step">（第 <span id="current-seq"></span> / 6 步）</span>
     </p>
+    <fieldset class="units" aria-label="录入单位">
+      <legend>录入单位</legend>
+      <label><input type="radio" name="unit" value="cN·m" checked> cN·m（工位默认，整数）</label>
+      <label><input type="radio" name="unit" value="N·m"> N·m（数显扳手，最多两位小数）</label>
+    </fieldset>
     <label class="field">
-      扭矩（cN·m，合格范围 4200–4800，含边界）
+      <span id="torque-label">扭矩（cN·m，合格范围 4200–4800，含边界）</span>
       <input id="torque-input" type="number" step="1" min="4200" max="4800"
              inputmode="numeric" autocomplete="off" placeholder="例如 4500">
     </label>

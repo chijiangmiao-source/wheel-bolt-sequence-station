@@ -32,7 +32,12 @@ CREATE TABLE confirmations (
   session_id      UUID NOT NULL REFERENCES sessions (id),
   sequence        INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 6),
   position        TEXT NOT NULL CHECK (position IN ('A1', 'B2', 'A3', 'B1', 'A2', 'B3')),
+  -- 标准扭矩：换算后的整数 cN·m，既有顺序/范围/幂等判定与历史展示均以此为准
   torque          INTEGER NOT NULL CHECK (torque BETWEEN 4200 AND 4800),
+  -- 原始读数与录入单位：操作工实际录入的值（N·m 保留至多两位小数），仅作记录；
+  -- 统一存为普通十进制文本以保真（如 42.00），标准字段 torque 才用于业务判定
+  torque_input    TEXT NOT NULL CHECK (torque_input ~ '^[0-9]+(\.[0-9]+)?$'),
+  torque_unit     TEXT NOT NULL CHECK (torque_unit IN ('cN·m', 'N·m')),
   idempotency_key TEXT NOT NULL,
   confirmed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- 同一会话内：每个序号至多一条确认；每个幂等键至多绑定一条确认

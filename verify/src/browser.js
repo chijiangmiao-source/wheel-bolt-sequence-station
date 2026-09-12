@@ -43,7 +43,10 @@ export async function runBrowser(webBase, apiBase, t) {
     return page;
   }
 
-  async function confirmCurrent(page, torque) {
+  async function confirmCurrent(page, torque, unit) {
+    if (unit) {
+      await page.check(`input[name="unit"][value="${unit}"]`);
+    }
     await page.fill('#torque-input', String(torque));
     await page.click('#btn-submit');
   }
@@ -266,6 +269,67 @@ export async function runBrowser(webBase, apiBase, t) {
       assertEqual(await currentPosition(page), 'A1', '再次拒绝后仍停留在 A1');
       const st = await serverState(page);
       assertEqual(st.confirmations.length, 0, '服务端无确认记录');
+      await closePage(page);
+    });
+
+    await t.test('N·m 边界读数 42.00 / 48.00 可完成步骤，历史按 cN·m 展示', async () => {
+      const page = await newSessionPage();
+      await confirmCurrent(page, '42.00', 'N·m');
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      const first = await page.textContent('#bolt-list li.done .meta');
+      assert(first.includes('4200 cN·m'), `已完成步骤应按 cN·m 展示，实际：${first}`);
+      await confirmCurrent(page, '48.00', 'N·m');
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+      // 其余步骤回到工位默认 cN·m
+      for (let i = 2; i < 6; i += 1) {
+        await page.check('input[name="unit"][value="cN·m"]');
+        await page.fill('#torque-input', String([4500, 4600, 4400, 4700][i - 2]));
+        await page.click('#btn-submit');
+        if (i < 5) {
+          await page.waitForFunction(
+            (pos) => document.getElementById('current-position').textContent.trim() === pos,
+            POSITIONS[i + 1],
+          );
+        }
+      }
+      await page.waitForSelector('#done-banner:not([hidden])');
+      const rows = page.locator('#confirm-table tbody tr');
+      assertEqual(await rows.count(), 6, '应列出六条确认');
+      assertEqual((await rows.nth(0).locator('td').nth(2).textContent()).trim(), '4200', '第 1 步明细为标准值 4200 cN·m');
+      assertEqual((await rows.nth(1).locator('td').nth(2).textContent()).trim(), '4800', '第 2 步明细为标准值 4800 cN·m');
+      const st = await serverState(page);
+      assertEqual(st.status, 'completed', '服务端状态应为完成');
+      assertEqual(st.confirmations[0].torque_input, '42.00', '事件保存原始读数 42.00');
+      assertEqual(st.confirmations[0].torque_unit, 'N·m', '事件保存原始单位 N·m');
+      assertEqual(st.confirmations[0].torque, 4200, '标准字段为 4200 cN·m');
+      await closePage(page);
+    });
+
+    await t.test('N·m 读数 41.99 被拒绝并停留在当前螺栓，超过两位小数当场提示', async () => {
+      const page = await newSessionPage();
+      await confirmCurrent(page, '41.99', 'N·m');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('拒绝'));
+      const err = await page.textContent('#error');
+      assert(err.includes('4199'), `拒绝原因应给出换算后的 cN·m 值，实际：${err}`);
+      assertEqual(await currentPosition(page), 'A1', '仍停留在 A1');
+      const st0 = await serverState(page);
+      assertEqual(st0.confirmations.length, 0, '拒绝不写事件');
+      // 精度超限：页面在提交前拦截，不产生请求
+      await page.fill('#torque-input', '45.123');
+      await page.click('#btn-submit');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('两位小数'));
+      assertEqual(await currentPosition(page), 'A1', '精度提示后仍停留在 A1');
+      const st1 = await serverState(page);
+      assertEqual(st1.confirmations.length, 0, '精度超限不写事件');
+      // 修正为合格 N·m 后可继续
+      await confirmCurrent(page, '45.00', 'N·m');
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
       await closePage(page);
     });
 

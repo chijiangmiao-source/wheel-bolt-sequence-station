@@ -48,6 +48,16 @@ async function postCancel(base, sid, reason) {
   return { status: r.status, body: await r.json() };
 }
 
+/** 以原始 JSON 文本提交（用于保真发送 42.00 等读数）。 */
+async function postConfRaw(base, sid, rawPayload) {
+  const r = await fetch(`${base}/api/sessions/${sid}/confirmations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: `{"session_id":${JSON.stringify(sid)},${rawPayload}}`,
+  });
+  return { status: r.status, body: await r.json() };
+}
+
 async function confirmSteps(base, sid, n) {
   for (let i = 0; i < n; i += 1) {
     const r = await postConf(base, sid, {
@@ -114,6 +124,110 @@ export async function runProtocol(base, t) {
     const st = await getSession(base, s.session_id);
     assertEqual(st.confirmations.length, 1, '冲突不产生新记录');
     assertEqual(st.expected_sequence, 2, '冲突不推进');
+  });
+
+  await t.test('N·m 边界读数 42.00 / 48.00 精确换算后合格，原始读数与单位随事件保存', async () => {
+    const s = await createSession(base);
+    // 以原始 JSON 文本发送，保真两位小数尾零
+    const r1 = await postConfRaw(
+      base,
+      s.session_id,
+      '"sequence":1,"position":"A1","torque":42.00,"unit":"N·m","idempotency_key":' + JSON.stringify(key('nm42')),
+    );
+    assertEqual(r1.status, 201, '42.00 N·m 边界应合格');
+    assertEqual(r1.body.confirmation.torque, 4200, '标准字段应为整数 4200 cN·m');
+    assertEqual(r1.body.confirmation.torque_input, '42.00', '原始读数应保真为 42.00');
+    assertEqual(r1.body.confirmation.torque_unit, 'N·m', '原始单位应为 N·m');
+    const r2 = await postConfRaw(
+      base,
+      s.session_id,
+      '"sequence":2,"position":"B2","torque":48.00,"unit":"N·m","idempotency_key":' + JSON.stringify(key('nm48')),
+    );
+    assertEqual(r2.status, 201, '48.00 N·m 边界应合格');
+    assertEqual(r2.body.confirmation.torque, 4800, '标准字段应为整数 4800 cN·m');
+    assertEqual(r2.body.confirmation.torque_input, '48.00', '原始读数应保真为 48.00');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.expected_sequence, 3, '两个边界步骤正常推进');
+    assertEqual(st.confirmations[0].torque, 4200, '历史明细仍按 cN·m 展示');
+  });
+
+  await t.test('N·m 读数 41.99 换算为 4199 cN·m：越界拒绝、不写事件、不推进', async () => {
+    const s = await createSession(base);
+    const r = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: '41.99', unit: 'N·m', idempotency_key: key('nm4199'),
+    });
+    assertEqual(r.status, 422, '越界状态码');
+    assertEqual(r.body.error.code, 'torque_out_of_range', '扭矩错误码');
+    assert(r.body.error.message.includes('4199'), '原因应给出换算后的 cN·m 值');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations.length, 0, '拒绝不产生事件');
+    assertEqual(st.expected_sequence, 1, '拒绝不推进序号');
+  });
+
+  await t.test('N·m 精度超限（45.123）与无法精确换算（超大数）：422 且不推进', async () => {
+    const s = await createSession(base);
+    const precision = await postConfRaw(
+      base,
+      s.session_id,
+      '"sequence":1,"position":"A1","torque":45.123,"unit":"N·m","idempotency_key":' + JSON.stringify(key('prec')),
+    );
+    assertEqual(precision.status, 422, '精度超限状态码');
+    assertEqual(precision.body.error.code, 'torque_precision_exceeded', '精度错误码');
+    const huge = await postConfRaw(
+      base,
+      s.session_id,
+      '"sequence":1,"position":"A1","torque":1e30,"unit":"N·m","idempotency_key":' + JSON.stringify(key('huge')),
+    );
+    assertEqual(huge.status, 422, '无法换算状态码');
+    assertEqual(huge.body.error.code, 'torque_unconvertible', '换算错误码');
+    const badUnit = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 45, unit: 'kgf·m', idempotency_key: key('badunit'),
+    });
+    assertEqual(badUnit.status, 400, '未知单位状态码');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations.length, 0, '均不产生事件');
+    assertEqual(st.expected_sequence, 1, '均不推进');
+  });
+
+  await t.test('同一幂等键用 45 N·m 与 4500 cN·m 重试：只产生一条确认', async () => {
+    const s = await createSession(base);
+    const k = key('sameintent');
+    const r1 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 45, unit: 'N·m', idempotency_key: k,
+    });
+    assertEqual(r1.status, 201, '首次 45 N·m 成功');
+    assertEqual(r1.body.confirmation.torque, 4500, '换算为 4500 cN·m');
+    // 同键、同一步骤，旧格式整数 cN·m 重试
+    const r2 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4500, idempotency_key: k,
+    });
+    assertEqual(r2.status, 200, '重试应返回 200');
+    assertEqual(r2.body.replayed, true, '应标记为重放');
+    assertEqual(r2.body.confirmation.id, r1.body.confirmation.id, '应返回原确认事件');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations.length, 1, '只落库一条确认');
+    assertEqual(st.confirmations[0].torque_unit, 'N·m', '原确认保留首次录入单位');
+    assertEqual(st.expected_sequence, 2, '只推进一次');
+  });
+
+  await t.test('旧格式客户端（整数 torque、不传 unit）完成完整六步流程', async () => {
+    const s = await createSession(base);
+    const torques = [4500, 4600, 4200, 4800, 4500, 4700];
+    for (let i = 0; i < 6; i += 1) {
+      const r = await postConf(base, s.session_id, {
+        sequence: i + 1,
+        position: POSITIONS[i],
+        torque: torques[i],
+        idempotency_key: key('legacy'),
+      });
+      assertEqual(r.status, 201, `旧格式第 ${i + 1} 步状态码`);
+      assertEqual(r.body.confirmation.torque, torques[i], `第 ${i + 1} 步标准扭矩`);
+      assertEqual(r.body.confirmation.torque_unit, 'cN·m', `第 ${i + 1} 步缺省单位应为 cN·m`);
+      assertEqual(r.body.confirmation.torque_input, String(torques[i]), `第 ${i + 1} 步原始读数`);
+    }
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '旧格式六步后完成');
+    assertEqual(st.confirmations.length, 6, '六条确认事件');
   });
 
   await t.test('较小序号视为迟到：409 且不推进', async () => {

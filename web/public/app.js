@@ -22,6 +22,22 @@ const WORK_ORDER_KEY = 'hub_review.work_order_code';
 const REQUEST_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 6; // 首次 + 5 次自动重试（同一幂等键）
 
+const UNIT_CNM = 'cN·m';
+const UNIT_NM = 'N·m';
+// 工位默认录入单位保持 cN·m；操作工可切换到 N·m（最多两位小数）
+const DEFAULT_UNIT = UNIT_CNM;
+// 各单位的输入约束（N·m 为 cN·m 合格范围除以 100）
+const UNIT_RULES = {
+  [UNIT_CNM]: {
+    label: '扭矩（cN·m，合格范围 4200–4800，含边界）',
+    step: '1', min: '4200', max: '4800', placeholder: '例如 4500',
+  },
+  [UNIT_NM]: {
+    label: '扭矩（N·m，合格范围 42.00–48.00，含边界，最多两位小数）',
+    step: '0.01', min: '42.00', max: '48.00', placeholder: '例如 45.00',
+  },
+};
+
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -32,6 +48,7 @@ const state = {
   cancelFormOpen: false, // 是否打开了终止原因填写面板
   cancelling: false, // 终止请求是否在途
   opening: false, // 是否有「打开复核 / 开始会话」请求在途
+  unit: DEFAULT_UNIT,
 };
 
 // 「打开其他工单」时暂存的本地现场：新工单打开失败则恢复原会话
@@ -83,7 +100,9 @@ function adoptSession(body, notice) {
   } else {
     localStorage.removeItem(WORK_ORDER_KEY);
   }
+  state.unit = DEFAULT_UNIT;
   $('torque-input').value = '';
+  renderUnitControls();
   if (notice) showNotice(notice);
 }
 
@@ -145,6 +164,47 @@ async function refresh() {
     showError('无法连接服务器，页面进度可能不是最新');
   }
   render();
+}
+
+/** 切换录入单位：cN·m 为工位默认，N·m 限两位小数。 */
+function switchUnit(unit) {
+  if (!UNIT_RULES[unit] || state.busy || unit === state.unit) return;
+  state.unit = unit;
+  $('torque-input').value = '';
+  clearMessages();
+  renderUnitControls();
+}
+
+function renderUnitControls() {
+  const rule = UNIT_RULES[state.unit];
+  const input = $('torque-input');
+  $('torque-label').textContent = rule.label;
+  input.step = rule.step;
+  input.min = rule.min;
+  input.max = rule.max;
+  input.placeholder = rule.placeholder;
+  document.querySelectorAll('input[name="unit"]').forEach((radio) => {
+    radio.checked = radio.value === state.unit;
+    radio.disabled = state.busy;
+  });
+}
+
+/** 按当前单位校验输入；N·m 只接受最多两位小数。通过时返回录入原文以保真发送。 */
+function parseReading(raw) {
+  if (raw === '') return { ok: false, message: '请输入扭矩值' };
+  if (state.unit === UNIT_CNM) {
+    if (!/^\d+$/.test(raw)) {
+      return { ok: false, message: 'cN·m 读数必须为整数（例如 4500）' };
+    }
+    if (!Number.isSafeInteger(Number(raw))) {
+      return { ok: false, message: 'cN·m 读数超出可处理范围' };
+    }
+    return { ok: true, value: raw };
+  }
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw)) {
+    return { ok: false, message: 'N·m 读数最多保留两位小数（例如 45.00）' };
+  }
+  return { ok: true, value: raw };
 }
 
 /** 按工单码打开复核：已绑定接续，未绑定从第一颗新建。失败时不覆盖本地已有会话。 */
@@ -228,9 +288,9 @@ async function submitConfirmation() {
   if (state.busy || !state.view || state.view.status !== 'in_progress') return;
 
   const raw = $('torque-input').value.trim();
-  const torque = Number(raw);
-  if (raw === '' || !Number.isInteger(torque)) {
-    showError('请输入整数扭矩值（cN·m）');
+  const parsed = parseReading(raw);
+  if (!parsed.ok) {
+    showError(parsed.message);
     return;
   }
 
@@ -240,7 +300,8 @@ async function submitConfirmation() {
     session_id: state.sessionId,
     sequence: state.view.expected_sequence,
     position: state.view.expected_position,
-    torque,
+    torque: parsed.value,
+    unit: state.unit,
     idempotency_key: uuid(),
   };
 
@@ -430,6 +491,9 @@ function render() {
   $('btn-open').disabled = state.busy || state.opening;
   $('btn-new').disabled = state.busy || state.opening;
   $('workorder-input').disabled = state.busy || state.opening;
+  document.querySelectorAll('input[name="unit"]').forEach((radio) => {
+    radio.disabled = state.busy || state.cancelling || state.opening || !inProgress;
+  });
 }
 
 /** 启动时恢复：优先按本地工单码向服务端打开权威会话；无码则按旧方式读取会话。 */
@@ -488,6 +552,11 @@ window.addEventListener('DOMContentLoaded', () => {
   $('workorder-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') openByWorkOrder();
   });
+  document.querySelectorAll('input[name="unit"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      if (radio.checked) switchUnit(radio.value);
+    });
+  });
   $('torque-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitConfirmation();
   });
@@ -499,5 +568,6 @@ window.addEventListener('DOMContentLoaded', () => {
     $('cancel-reason-hint').textContent =
       len === 0 ? '' : `${len} / 100 字（需 2–100 字）`;
   });
+  renderUnitControls();
   restore();
 });

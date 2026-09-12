@@ -46,8 +46,8 @@ docker compose run --rm verify
 
 验收覆盖：
 
-- **协议用例**（直连 API）：固定顺序与边界扭矩、幂等重放与冲突、迟到/越序/位置/扭矩拒绝、并发去重、数据库事件不可变；工单码首次与重复打开、跨终端续作、并发首次打开、非法码和无码旧客户端；带原因终止、终止后拒绝、重复终止、完成态保护、原因长度边界及最后一步与终止并发；
-- **页面用例**（真实 Chromium 驱动页面）：六步完成、异常扭矩、刷新恢复、网络重试、慢响应连点和完成态刷新；新工单、另一浏览器接续、并发首次打开、非法码及无码旧流程；完成两步后终止、展示并持久化原因与时间、关闭扭矩提交。
+- **协议用例**（直连 API）：固定顺序、边界扭矩和幂等冲突；N·m 精确换算、精度与越界拒绝、跨单位幂等重放及旧格式客户端；工单码首次与重复打开、跨终端续作、并发首次打开和非法码；带原因终止、终止后拒绝、重复终止、完成态保护及最后一步与终止并发；迟到、越序、位置、扭矩、未知会话与缺字段拒绝、并发去重和数据库事件不可变；
+- **页面用例**（真实 Chromium 驱动页面）：六步完成、异常扭矩、刷新恢复、网络重试、慢响应连点和完成态刷新；N·m 边界读数、越界与精度拒绝及历史 cN·m 展示；新工单、另一浏览器接续、并发首次打开、非法码及无码旧流程；完成两步后终止、展示并持久化原因与时间、关闭扭矩提交。
 
 ## API 协议
 
@@ -77,13 +77,30 @@ docker compose run --rm verify
   "sequence": 1,
   "position": "A1",
   "torque": 4500,
+  "unit": "cN·m",
   "idempotency_key": "客户端为本次提交意图生成的唯一键"
 }
 ```
 
-- `sequence`：从 1 开始的整数序号；`position`：位置码；`torque`：整数（cN·m），合格范围 **4200–4800 含边界**；`idempotency_key`：1–128 字符。
+- `sequence`：从 1 开始的整数序号；`position`：位置码；`idempotency_key`：1–128 字符。
+- `torque`：读数。配合 `unit` 使用，支持 JSON 数字或十进制文本字符串（如 `"42.00"`，页面按录入原文发送以保真）：
+  - `unit` 为 `"cN·m"` 或**不传**（旧格式客户端）：整数 cN·m，合格范围 **4200–4800 含边界**；
+  - `unit` 为 `"N·m"`：数显扳手读数，**最多两位小数**，服务端先精确换算（×100，BigInt 十进制，不走浮点）为整数 cN·m，合格范围 **42.00–48.00 含边界**。
 - 成功：`201` `{ replayed: false, confirmation, progress }`；重放：`200` `{ replayed: true, confirmation, progress }`。
 - 失败：`{ error: { code, message }, progress }`，`message` 为可直接展示的中文原因，`progress` 为当前权威进度。
+- `confirmation` 同时返回标准字段 `torque`（整数 cN·m，进度与完成明细使用）与原始读数 `torque_input`、`torque_unit`（仅作记录；历史明细仍按 cN·m 展示）。
+
+### 录入单位与换算失败
+
+现场部分数显扭矩扳手只显示 N·m，操作工无需心算：
+
+- 工位默认单位保持 **cN·m**，可在页面切换为 **N·m**（最多两位小数），提交仍走同一个确认入口；
+- 服务端先精确换算再执行既有的顺序、范围与幂等判定，因此 **45 N·m 与 4500 cN·m 是同一标准载荷**，同一幂等键跨单位重试只返回原确认；
+- 换算失败时页面展示中文原因并停留在当前螺栓，失败请求不写事件、不推进序号：
+  - 超过两位小数（无法精确换算为整数 cN·m）→ `422 torque_precision_exceeded`；
+  - 数值过大无法精确换算 → `422 torque_unconvertible`；
+  - 换算后越界（如 41.99 N·m = 4199 cN·m）→ `422 torque_out_of_range`，原因中同时给出原始读数与换算值。
+- 空请求体创建会话、以及不传 `unit` 的旧格式确认请求，均保持原语义。
 
 ### 重试语义（核心）
 
@@ -96,7 +113,7 @@ docker compose run --rm verify
    - `sequence < 当前期待序号` → `409 late_sequence`（迟到响应，拒绝）；
    - `sequence > 当前期待序号` → `409 out_of_order_sequence`（越序，拒绝）。
 3. **位置校验**：位置码与当前期待步骤不符 → `422 position_mismatch`。
-4. **扭矩校验**：超出 4200–4800（含边界）→ `422 torque_out_of_range`；非整数等非法请求体 → `400 invalid_body`；未知会话 → `404 session_not_found`。
+4. **扭矩校验**：服务端先按 `unit` 把读数精确换算为整数 cN·m（缺省单位按 cN·m），再判定 4200–4800（含边界）→ `422 torque_out_of_range`；N·m 超过两位小数 → `422 torque_precision_exceeded`；无法精确换算 → `422 torque_unconvertible`；非整数 cN·m、非法单位等非法请求体 → `400 invalid_body`；未知会话 → `404 session_not_found`。
 
 并发与一致性：同一会话的提交在事务内以 `SELECT ... FOR UPDATE` 行锁串行化；`(session_id, sequence)` 与 `(session_id, idempotency_key)` 唯一约束兜底，因此并发重试/触屏连点最多落库一条确认。确认事件表由触发器禁止 `UPDATE/DELETE`，是只增不改的事件日志。
 
@@ -126,7 +143,7 @@ docker compose run --rm verify
 
 ## 数据模型
 
-- `sessions(id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调递增（1→7），只在有效确认落库的同一事务中推进；`work_order_code` 可空且非空值全表唯一；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空（库级约束保证）；
-- `confirmations(id, session_id, sequence, position, torque, idempotency_key, confirmed_at)`：不可变事件，唯一约束 `(session_id, sequence)`、`(session_id, idempotency_key)`。
+- `sessions(id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调递增（1→7），只在有效确认落库的同一事务中推进；`work_order_code` 可空且非空值全表唯一；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空；
+- `confirmations(id, session_id, sequence, position, torque, torque_input, torque_unit, idempotency_key, confirmed_at)`：不可变事件，`torque` 为换算后的整数 cN·m 标准字段，`torque_input`/`torque_unit` 保存操作工原始读数与单位；唯一约束 `(session_id, sequence)`、`(session_id, idempotency_key)`。
 
 重置数据：`docker compose down -v`（清空数据卷后 `db/init.sql` 会重新执行）。

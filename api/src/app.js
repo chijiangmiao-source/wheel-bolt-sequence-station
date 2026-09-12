@@ -12,6 +12,15 @@ import {
   WORK_ORDER_CODE_MIN_LENGTH,
   WORK_ORDER_CODE_MAX_LENGTH,
 } from './constants.js';
+import {
+  UNIT_CNM,
+  UNIT_NM,
+  INPUT_UNITS,
+  DEFAULT_UNIT,
+  NM_MAX_DECIMALS,
+  readTorqueToken,
+  convertNmToCnm,
+} from './torque.js';
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -54,7 +63,11 @@ function confirmationView(row) {
     session_id: row.session_id,
     sequence: row.sequence,
     position: row.position,
+    // 标准扭矩（整数 cN·m）：现有进度与完成明细继续使用
     torque: row.torque,
+    // 原始读数与录入单位：仅作记录，历史明细仍按 cN·m 展示
+    torque_input: row.torque_input,
+    torque_unit: row.torque_unit,
     idempotency_key: row.idempotency_key,
     confirmed_at: row.confirmed_at,
   };
@@ -84,6 +97,9 @@ function sessionView(session, confirmations) {
     created_at: session.created_at,
     positions: POSITIONS,
     torque_range: { min: TORQUE_MIN, max: TORQUE_MAX, unit: 'cN·m' },
+    input_units: INPUT_UNITS,
+    default_unit: DEFAULT_UNIT,
+    nm_max_decimals: NM_MAX_DECIMALS,
     ...progressOf(session),
     confirmations: confirmations.map(confirmationView),
   };
@@ -122,9 +138,106 @@ async function openWorkOrderSession(client, code) {
   return { created: false, session: existing.rows[0] };
 }
 
+/**
+ * 解析确认请求中的读数与单位，精确换算为整数 cN·m。
+ * 单位缺省视为 cN·m（旧格式客户端语义不变）；N·m 读数最多两位小数。
+ * torque 接受 JSON 数字或十进制文本字符串（页面按录入原文发送以保真，如 42.00）。
+ * @returns {{cnm:number, inputText:string, unit:string}}
+ */
+function parseTorque(body, rawBody) {
+  const unit = body.unit === undefined ? DEFAULT_UNIT : body.unit;
+  if (typeof unit !== 'string' || !INPUT_UNITS.includes(unit)) {
+    throw new ApiError(
+      400,
+      'invalid_body',
+      `unit 必须为单位之一：${INPUT_UNITS.join('、')}；不传则按 cN·m 处理`,
+    );
+  }
+
+  // 数字取请求体原文（避免浮点），字符串取其文本；两种来源都用 BigInt 精确处理
+  const tokenInfo = readTorqueToken(rawBody);
+  let token;
+  let source;
+  if (tokenInfo && tokenInfo.kind === 'number') {
+    token = tokenInfo.token;
+    source = 'number';
+  } else if (typeof body.torque === 'string') {
+    token = body.torque.trim();
+    source = 'string';
+  } else {
+    throw new ApiError(
+      400,
+      'invalid_body',
+      unit === UNIT_CNM
+        ? 'torque 必须为整数（单位 cN·m）'
+        : `torque 必须为数字（单位 N·m，最多 ${NM_MAX_DECIMALS} 位小数）`,
+    );
+  }
+
+  if (unit === UNIT_CNM) {
+    // 旧语义：读数必须为整数（cN·m），不允许有效小数；4500.00 等纯零小数视为整数 4500
+    const m = /^-?(?:0|[1-9]\d*)(?:\.0+)?$/.exec(token);
+    if (!m) {
+      throw new ApiError(400, 'invalid_body', 'torque 必须为整数（单位 cN·m）');
+    }
+    const cnm = Number(token.replace(/\.\d+$/, ''));
+    if (!Number.isSafeInteger(cnm)) {
+      throw new ApiError(400, 'invalid_body', 'torque 必须为整数（单位 cN·m）');
+    }
+    return { cnm, inputText: String(cnm), unit };
+  }
+
+  const result = convertNmToCnm(token);
+  if (!result.ok) {
+    if (result.reason === 'precision') {
+      throw new ApiError(
+        422,
+        'torque_precision_exceeded',
+        `N·m 读数 ${token} 超过 ${NM_MAX_DECIMALS} 位小数，无法精确换算为整数 cN·m，未推进`,
+      );
+    }
+    // 文本不是合法十进制 → 请求体非法；合法数字但数值过大 → 无法精确换算
+    if (source === 'string' && !/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(token)) {
+      throw new ApiError(
+        400,
+        'invalid_body',
+        `N·m 读数 ${token} 不是合法的十进制数字`,
+      );
+    }
+    throw new ApiError(
+      422,
+      'torque_unconvertible',
+      `N·m 读数 ${token} 无法精确换算为整数 cN·m，未推进`,
+    );
+  }
+  // 原始读数保真：普通十进制文本原样保存；科学计数法规范化为普通十进制
+  const inputText = /[eE]/.test(token)
+    ? formatNmFromCnm(result.cnm, decimalScaleOf(token))
+    : token;
+  return { cnm: result.cnm, inputText, unit };
+}
+
+/** JSON 数字记号（已通过换算校验）在十进制下的小数位数。 */
+function decimalScaleOf(token) {
+  const m = /^-?(?:0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(token);
+  const frac = m[1] ?? '';
+  const exp = m[2] === undefined ? 0 : Number(m[2]);
+  return Math.max(0, frac.length - exp);
+}
+
+/** 由整数 cN·m 反推普通十进制 N·m 文本（scale ∈ 0..2），不使用浮点。 */
+function formatNmFromCnm(cnm, scale) {
+  const sign = cnm < 0 ? '-' : '';
+  const digits = String(Math.abs(cnm)).padStart(3, '0');
+  if (scale === 0) return sign + digits.slice(0, -2);
+  const cut = digits.length - 2;
+  return `${sign}${digits.slice(0, cut)}.${digits.slice(cut, cut + scale)}`;
+}
+
 export function createApp() {
   const app = express();
-  app.use(express.json());
+  // 捕获请求体原文：N·m 读数需按十进制文本精确换算，不能用解析后的浮点值
+  app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
   // 允许跨源访问（页面默认经 web 容器同源代理 /api，此为兜底）
   app.use((req, res, next) => {
@@ -280,7 +393,7 @@ export function createApp() {
         throw new ApiError(404, 'session_not_found', '会话不存在');
       }
       const body = req.body ?? {};
-      const { session_id, sequence, position, torque, idempotency_key } = body;
+      const { session_id, sequence, position, idempotency_key } = body;
 
       if (session_id !== id) {
         throw new ApiError(400, 'invalid_body', '会话编号与请求路径不一致');
@@ -295,9 +408,6 @@ export function createApp() {
           `position 必须为位置码之一：${POSITIONS.join('、')}`,
         );
       }
-      if (!Number.isInteger(torque)) {
-        throw new ApiError(400, 'invalid_body', 'torque 必须为整数（单位 cN·m）');
-      }
       if (
         typeof idempotency_key !== 'string' ||
         idempotency_key.length === 0 ||
@@ -309,6 +419,9 @@ export function createApp() {
           `idempotency_key 必须为 1–${IDEMPOTENCY_KEY_MAX_LENGTH} 字符的字符串`,
         );
       }
+      // 先精确换算为整数 cN·m，之后顺序、范围、幂等判定一律使用标准值。
+      // 单位缺省按 cN·m 处理，保持旧格式客户端语义。
+      const { cnm: torque, inputText: torqueInput, unit } = parseTorque(body, req.rawBody);
 
       await client.query('BEGIN');
       // 会话行锁：同一会话的提交串行化，配合唯一约束兜底并发重试
@@ -390,20 +503,22 @@ export function createApp() {
         );
       }
 
-      // 4) 扭矩须在合格范围内（含边界）
+      // 4) 扭矩须在合格范围内（含边界），判定一律使用换算后的标准 cN·m
       if (torque < TORQUE_MIN || torque > TORQUE_MAX) {
+        const reading = `${torqueInput} ${unit}`;
         throw new ApiError(
           422,
           'torque_out_of_range',
-          `扭矩 ${torque} cN·m 超出合格范围 ${TORQUE_MIN}–${TORQUE_MAX} cN·m，未推进`,
+          `扭矩 ${reading}（${torque} cN·m）超出合格范围 ${TORQUE_MIN}–${TORQUE_MAX} cN·m，未推进`,
           { progress },
         );
       }
 
       const ins = await client.query(
-        `INSERT INTO confirmations (session_id, sequence, position, torque, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [id, sequence, position, torque, idempotency_key],
+        `INSERT INTO confirmations
+           (session_id, sequence, position, torque, torque_input, torque_unit, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [id, sequence, position, torque, torqueInput, unit, idempotency_key],
       );
       const newStatus = sequence === TOTAL_STEPS ? 'completed' : 'in_progress';
       const upd = await client.query(

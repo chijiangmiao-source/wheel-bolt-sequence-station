@@ -203,6 +203,20 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
   border-radius: 6px;
 }
 
+.units {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+}
+
+.units legend { color: var(--muted); font-size: 14px; padding: 0 4px; }
+.units label { display: inline-flex; align-items: center; gap: 6px; font-size: 15px; color: var(--ink); }
+.units input { width: auto; margin: 0; }
+
 .notice, .error { min-height: 1.4em; margin: 10px 0 0; font-size: 15px; }
 .notice { color: var(--info); }
 .error { color: var(--err); font-weight: 600; }
