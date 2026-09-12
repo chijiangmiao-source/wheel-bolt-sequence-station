@@ -46,8 +46,8 @@ docker compose run --rm verify
 
 验收覆盖：
 
-- **协议用例**（直连 API）：固定顺序、边界扭矩和幂等冲突；N·m 精确换算、精度与越界拒绝、跨单位幂等重放及旧格式客户端；工单码首次与重复打开、跨终端续作、并发首次打开和非法码；带原因终止、终止后拒绝、重复终止、完成态保护及最后一步与终止并发；迟到、越序、位置、扭矩、未知会话与缺字段拒绝、并发去重和数据库事件不可变；
-- **页面用例**（真实 Chromium 驱动页面）：六步完成、异常扭矩、刷新恢复、网络重试、慢响应连点和完成态刷新；N·m 边界读数、越界与精度拒绝及历史 cN·m 展示；新工单、另一浏览器接续、并发首次打开、非法码及无码旧流程；完成两步后终止、展示并持久化原因与时间、关闭扭矩提交。
+- **协议用例**（直连 API）：固定顺序、边界扭矩和幂等冲突；N·m 精确换算、精度与越界拒绝、跨单位幂等重放及旧格式客户端；工单码首次与重复打开、跨终端续作、并发首次打开和非法码；带原因终止、终止后拒绝、重复终止、完成态保护及最后一步与终止并发；迟到、越序、位置、扭矩、未知会话与缺字段拒绝、并发去重和数据库事件不可变；撤回上一步（撤回第二步以新扭矩重做后完成、刷新后只有重做记录且保留审计、重复撤回与无可撤回拒绝、完成态/终止态保护、两个撤回竞争只成功一次、撤回与确认并发、撤回事件不可变）；
+- **页面用例**（真实 Chromium 驱动页面）：六步完成、异常扭矩、刷新恢复、网络重试、慢响应连点和完成态刷新；N·m 边界读数、越界与精度拒绝及历史 cN·m 展示；新工单、另一浏览器接续、并发首次打开、非法码及无码旧流程；完成两步后终止、展示并持久化原因与时间、关闭扭矩提交；二次确认撤回第二步并以新扭矩重做完成、刷新后只显示重做记录且保留撤回审计、并发先撤回时页面收到明确原因并保留当前输入。
 
 ## API 协议
 
@@ -57,6 +57,7 @@ docker compose run --rm verify
 | POST | `/api/work-orders/{code}/session` | **按工单码打开复核**：同一事务内返回已绑定会话（`200`），尚未绑定时才创建（`201`） |
 | GET | `/api/sessions/{id}` | 读取权威进度（页面刷新后以此为准） |
 | POST | `/api/sessions/{id}/confirmations` | 提交一次复核确认 |
+| POST | `/api/sessions/{id}/confirmations/last/retract` | **撤回上一步**：为当前最后一条有效确认追加不可变撤回事件并回到该颗，随后可重新确认 |
 | POST | `/api/sessions/{id}/cancel` | 带原因终止复核（拆下返修/装夹错误），幂等可重放 |
 | GET | `/healthz` | 健康检查 |
 
@@ -115,7 +116,7 @@ docker compose run --rm verify
 3. **位置校验**：位置码与当前期待步骤不符 → `422 position_mismatch`。
 4. **扭矩校验**：服务端先按 `unit` 把读数精确换算为整数 cN·m（缺省单位按 cN·m），再判定 4200–4800（含边界）→ `422 torque_out_of_range`；N·m 超过两位小数 → `422 torque_precision_exceeded`；无法精确换算 → `422 torque_unconvertible`；非整数 cN·m、非法单位等非法请求体 → `400 invalid_body`；未知会话 → `404 session_not_found`。
 
-并发与一致性：同一会话的提交在事务内以 `SELECT ... FOR UPDATE` 行锁串行化；`(session_id, sequence)` 与 `(session_id, idempotency_key)` 唯一约束兜底，因此并发重试/触屏连点最多落库一条确认。确认事件表由触发器禁止 `UPDATE/DELETE`，是只增不改的事件日志。
+并发与一致性：同一会话的提交在事务内以 `SELECT ... FOR UPDATE` 行锁串行化；`(session_id, idempotency_key)` 唯一约束与「每序号至多一条有效确认」触发器兜底，因此并发重试/触屏连点最多落库一条确认。确认事件表与撤回事件表均由触发器禁止 `UPDATE/DELETE`，是只增不改的事件日志。
 
 ### 终止复核（POST /cancel）
 
@@ -132,6 +133,37 @@ docker compose run --rm verify
 
 `GET /api/sessions/{id}` 在已终止会话上额外返回 `cancel_reason`、`cancelled_at`；其余字段与原格式一致，旧客户端的创建、查询、确认请求不受影响。
 
+### 撤回上一步（POST /confirmations/last/retract）
+
+操作工提交后发现刚录入的扭矩抄错时，可撤回**当前最后一条有效确认**，不用废弃整轮复核：
+
+- 页面仅在会话进行中、至少有一条有效确认且尚未完成时显示「撤回上一步」，二次确认后调用本接口，空请求体即可；页面可附带 `{ "confirmation_id": 123 }` 做乐观并发校验；
+- 成功：`200 { retracted: true, replayed: false, retraction, progress }`，`progress.expected_sequence` 回退到被撤回那一步（如两步后撤回第二步回到序号 2 / B2），随后**仍从原确认入口** `POST /confirmations` 以**新幂等键**提交新读数；
+- 失败均随错误返回最新权威 `progress`：没有有效确认 → `409 no_active_confirmation`；会话已完成 → `409 session_completed`；目标已被另一请求先撤回 → `409 confirmation_already_retracted`；页面携带的目标已不是当前最后一条 → `409 retract_target_changed`；会话已终止 → `409 session_cancelled`；未知会话 → `404 session_not_found`；`confirmation_id` 非正整数 → `400 invalid_body`；
+- 失败时页面展示原因、保持最新权威进度且**不清除当前输入**，操作工修正后可立即重新提交；
+- 被撤回确认的旧幂等键不可再用：携带旧键的迟到重试得到 `409 confirmation_retracted`，不重放已失效读数；**重新确认必须生成新键**（页面在撤回后从原确认入口正常提交即可，键由页面按新提交意图生成）；
+- 撤回与确认/终止一样在**会话行锁事务**内执行，同一会话的撤回、确认、终止共用同一把行锁串行化；两个并发撤回只可能成功一次，另一个拿到回退后进度与 `confirmation_already_retracted`；
+- 撤回与确认并发：先取得行锁者生效——撤回先到则越序的后到确认按 `out_of_order_sequence` 拒绝；确认先到则陈旧撤回收 `retract_target_changed`，有效确认与期待序号始终一致。
+
+`retraction` 与会话视图中的 `retractions` 审计数组结构：
+
+```json
+{
+  "id": 1,
+  "confirmation_id": 7,
+  "sequence": 2,
+  "retracted_at": "2026-09-12T08:00:00.000Z",
+  "confirmation": {
+    "id": 7, "sequence": 2, "position": "B2", "torque": 4600,
+    "torque_input": "4600", "torque_unit": "cN·m",
+    "idempotency_key": "…", "confirmed_at": "2026-09-12T07:59:00.000Z"
+  }
+}
+```
+
+- `confirmations` 只包含**未撤回（有效）**记录——刷新后只显示重做后的有效记录；被撤回的原读数只出现在 `retractions` 审计数组中，按撤回顺序返回；新会话的创建响应中 `retractions` 为空数组，旧客户端忽略多余字段即可；
+- **事件不可变规则继续成立**：撤回只向 `confirmation_retractions` 追加事件，确认行本身不删除、不改写（UPDATE/DELETE 触发器仍然生效）；同一序号允许「撤回 → 重新确认」，因此 `confirmations` 表可能为同一序号保留多条历史记录，但触发器保证**任一时刻每个序号至多一条有效记录**；`(session_id, idempotency_key)` 唯一约束仍然成立，旧键语义不复用。
+
 页面侧约定：
 
 - 进入区以工单码「打开复核」为主入口（也可开始无码新会话）；本地保存会话编号与工单码，刷新或重启页面时优先按工单码向服务端打开权威会话；
@@ -140,10 +172,12 @@ docker compose run --rm verify
 - 提交在途时禁用提交按钮，避免触屏连点产生并发提交；
 - 刷新页面后重新 `GET` 权威进度；「轮毂复核完成」只在服务端状态为 `completed`（即六次有效确认全部落库）时显示，否则稳定停留在当前螺栓。
 - 「终止复核」仅在进行中会话可用：填写 2–100 字原因并确认后，页面展示终止时间与原因并关闭扭矩提交；刷新后从服务端恢复已终止态；旧页面不调用 `/cancel` 也不受任何影响。
+- 「撤回上一步」仅在进行中会话且已有有效确认时出现：二次确认面板明示将撤回的螺栓与读数，确认后以服务端返回的权威进度回到上一颗，**不清除扭矩输入框内容**，操作工可立即从原确认入口重新提交；失败（无可撤回记录、已完成、并发落败）时展示中文原因、对齐权威进度并保留输入；页面始终展示撤回审计表（被撤回的原读数与撤回时间），刷新后仍在。
 
 ## 数据模型
 
-- `sessions(id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调递增（1→7），只在有效确认落库的同一事务中推进；`work_order_code` 可空且非空值全表唯一；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空；
-- `confirmations(id, session_id, sequence, position, torque, torque_input, torque_unit, idempotency_key, confirmed_at)`：不可变事件，`torque` 为换算后的整数 cN·m 标准字段，`torque_input`/`torque_unit` 保存操作工原始读数与单位；唯一约束 `(session_id, sequence)`、`(session_id, idempotency_key)`。
+- `sessions(id, status, expected_sequence, work_order_code, cancel_reason, cancelled_at, created_at, updated_at)`：`expected_sequence` 单调推进（1→7），只在有效确认落库的同一事务中递增，在撤回上一步的同一事务中回退到被撤回序号（有效确认始终形成 `1..k` 前缀）；`work_order_code` 可空且非空值全表唯一；`status` 为 `in_progress`/`completed`/`cancelled`，终止原因与时间仅在 `cancelled` 时非空；
+- `confirmations(id, session_id, sequence, position, torque, torque_input, torque_unit, idempotency_key, confirmed_at)`：不可变事件，`torque` 为换算后的整数 cN·m 标准字段，`torque_input`/`torque_unit` 保存操作工原始读数与单位；唯一约束 `(session_id, idempotency_key)`；同一序号在撤回后允许重新确认，因此可能保留多条历史确认，由触发器保证任一时刻每个序号至多一条**有效**（无撤回事件）记录；
+- `confirmation_retractions(id, session_id, confirmation_id, sequence, retracted_at)`：不可变撤回事件，`confirmation_id` 唯一（每条确认至多被撤回一次，并发撤回只成功一次）；确认是否有效完全由是否存在对应撤回事件决定，确认行本身永不删除/改写。撤回事件同样禁止 UPDATE/DELETE。
 
 重置数据：`docker compose down -v`（清空数据卷后 `db/init.sql` 会重新执行）。

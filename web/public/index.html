@@ -52,7 +52,22 @@
              inputmode="numeric" autocomplete="off" placeholder="例如 4500">
     </label>
     <button id="btn-submit" type="button">确认复核</button>
+    <button id="btn-retract-open" class="btn-retract-outline" type="button">撤回上一步</button>
     <button id="btn-cancel-open" class="btn-danger-outline" type="button">终止复核</button>
+  </section>
+
+  <section id="retract-panel" class="retract-panel" hidden>
+    <h2>撤回上一步确认</h2>
+    <p class="hint">
+      将撤回当前最后一颗螺栓 <strong id="retract-position"></strong>
+      （第 <span id="retract-seq"></span> 步，读数
+      <strong id="retract-torque"></strong>）的确认，会话回到该螺栓等待重新录入。
+      原确认不会删除，会作为撤回审计记录永久保留。
+    </p>
+    <div class="retract-actions">
+      <button id="btn-retract-confirm" class="btn-retract" type="button">确认撤回并重新录入</button>
+      <button id="btn-retract-back" type="button">返回继续复核</button>
+    </div>
   </section>
 
   <section id="cancel-panel" class="cancel-panel" hidden>
@@ -78,6 +93,17 @@
     <p>终止时间：<strong id="cancelled-at"></strong></p>
     <p>终止原因：<strong id="cancelled-reason"></strong></p>
     <p class="hint">扭矩提交已关闭，如需继续请点击「开始新会话」。</p>
+  </section>
+
+  <section id="retractions-audit" class="audit" hidden>
+    <h2>撤回记录（审计）</h2>
+    <p class="hint">撤回不删除原始确认事件：下列读数已被撤回、不计入复核结果，仅作追溯。</p>
+    <table id="retraction-table">
+      <thead>
+        <tr><th>序号</th><th>位置</th><th>原读数</th><th>确认时间</th><th>撤回时间</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </section>
 
   <section id="done-banner" class="done" hidden>

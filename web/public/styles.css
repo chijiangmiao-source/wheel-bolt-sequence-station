@@ -83,6 +83,44 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 }
 #btn-cancel-open:hover:not(:disabled) { background: var(--err-bg); }
 
+#btn-retract-open {
+  margin-left: 10px;
+  color: var(--cur);
+  border-color: var(--cur);
+  background: #fff;
+}
+#btn-retract-open:hover:not(:disabled) { background: var(--cur-bg); }
+
+.btn-retract {
+  background: var(--cur);
+  border-color: var(--cur);
+  color: #fff;
+}
+.btn-retract:hover:not(:disabled) { background: #7d5400; }
+
+.retract-panel {
+  margin-top: 14px;
+  padding: 16px 20px;
+  border: 1px solid var(--cur);
+  border-radius: 8px;
+  background: var(--cur-bg);
+}
+
+.retract-panel h2 { margin: 0 0 8px; font-size: 18px; color: var(--cur); }
+.retract-actions { display: flex; gap: 10px; }
+
+.audit {
+  margin-top: 18px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f9fbfd;
+}
+
+.audit h2 { margin: 0 0 6px; font-size: 18px; }
+.audit .hint { margin: 0 0 10px; font-size: 14px; }
+.audit table { font-size: 14px; }
+
 .btn-danger {
   background: var(--err);
   border-color: var(--err);

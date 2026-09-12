@@ -47,6 +47,8 @@ const state = {
   busy: false, // 是否有提交在途（含自动重试）
   cancelFormOpen: false, // 是否打开了终止原因填写面板
   cancelling: false, // 终止请求是否在途
+  retractFormOpen: false, // 是否打开了撤回上一步确认面板
+  retracting: false, // 撤回请求是否在途
   opening: false, // 是否有「打开复核 / 开始会话」请求在途
   unit: DEFAULT_UNIT,
 };
@@ -94,6 +96,7 @@ function adoptSession(body, notice) {
   state.workOrderCode = body.work_order_code ?? null;
   state.view = body;
   state.cancelFormOpen = false;
+  state.retractFormOpen = false;
   localStorage.setItem(SESSION_KEY, state.sessionId);
   if (state.workOrderCode) {
     localStorage.setItem(WORK_ORDER_KEY, state.workOrderCode);
@@ -118,9 +121,9 @@ function backToEntry(notice) {
     state.workOrderCode = null;
     state.view = null;
     state.cancelFormOpen = false;
+    state.retractFormOpen = false;
     $('torque-input').value = '';
-    $('workorder-input').value = '';
-  }
+    $('workorder-input').value = '';  }
   clearMessages();
   if (notice) showNotice(notice);
   render();
@@ -401,6 +404,62 @@ async function cancelSession() {
   }
 }
 
+/** 打开/关闭撤回上一步确认面板。 */
+function setRetractForm(open) {
+  state.retractFormOpen = open;
+  if (open) showError('');
+  render();
+}
+
+/** 最后一条有效确认（撤回按钮与确认面板的目标）；无有效确认时为 null。 */
+function lastActiveConfirmation() {
+  const list = state.view?.confirmations;
+  return Array.isArray(list) && list.length > 0 ? list[list.length - 1] : null;
+}
+
+/** 撤回当前最后一颗螺栓的确认；成功后回到该螺栓，输入框内容保留以便立即重新录入。 */
+async function retractLast() {
+  if (state.retracting || !state.view || state.view.status !== 'in_progress') return;
+  const target = lastActiveConfirmation();
+  if (!target) return;
+
+  clearMessages();
+  state.retracting = true;
+  render();
+  try {
+    const { status, body } = await fetchJson(
+      `/sessions/${state.sessionId}/confirmations/last/retract`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // 携带页面所见目标：并发撤回落败（目标已被撤回）时服务端可给出明确原因
+        body: JSON.stringify({ confirmation_id: target.id }),
+      },
+    );
+    if (status === 200) {
+      state.retractFormOpen = false;
+      // 以服务端返回的权威进度为准（随后 refresh 拉取完整会话视图）；不清除当前输入
+      await refresh();
+      showNotice(
+        `已撤回第 ${body.retraction.sequence} 步（${body.retraction.confirmation.position}）` +
+          '的确认，请重新录入扭矩后提交',
+      );
+      $('torque-input').focus();
+    } else {
+      // 无可撤回记录 / 已完成 / 已被并发请求先撤回：展示原因并对齐权威进度，不清除输入
+      const message = (body && body.error && body.error.message) || `HTTP ${status}`;
+      state.retractFormOpen = false;
+      showError(`撤回失败：${message}`);
+      await refresh();
+    }
+  } catch {
+    showError('网络异常，撤回请求未送达，请点击「刷新进度」确认后重试');
+  } finally {
+    state.retracting = false;
+    render();
+  }
+}
+
 function render() {
   const view = state.view;
   $('session-id').textContent = state.sessionId ? state.sessionId.slice(0, 8) : '—';
@@ -439,11 +498,26 @@ function render() {
   }
 
   const inProgress = Boolean(view) && view.status === 'in_progress';
-  $('work-panel').hidden = !inProgress || state.cancelFormOpen;
+  $('work-panel').hidden = !inProgress || state.cancelFormOpen || state.retractFormOpen;
   if (inProgress) {
     $('current-position').textContent = view.expected_position;
     $('current-seq').textContent = String(view.expected_sequence);
   }
+
+  // 撤回上一步：仅进行中且存在有效确认时可操作（尚未完成、至少确认过一颗）
+  const lastConf = inProgress ? lastActiveConfirmation() : null;
+  const canRetract = Boolean(lastConf);
+  $('btn-retract-open').hidden = !canRetract;
+  $('btn-retract-open').disabled =
+    state.busy || state.cancelling || state.retracting || state.opening || !canRetract;
+  $('retract-panel').hidden = !inProgress || !state.retractFormOpen || !canRetract;
+  if (state.retractFormOpen && lastConf) {
+    $('retract-position').textContent = lastConf.position;
+    $('retract-seq').textContent = String(lastConf.sequence);
+    $('retract-torque').textContent = `${lastConf.torque} cN·m`;
+  }
+  $('btn-retract-confirm').disabled = state.retracting;
+  $('btn-retract-back').disabled = state.retracting;
 
   // 终止原因填写面板仅在进行中会话上可打开
   $('cancel-panel').hidden = !inProgress || !state.cancelFormOpen;
@@ -483,17 +557,43 @@ function render() {
 
   $('btn-submit').disabled = state.busy || !inProgress;
   $('torque-input').disabled = state.busy || !inProgress;
-  $('btn-cancel-open').disabled = state.busy || state.cancelling || state.opening || !inProgress;
-  $('btn-refresh').disabled = state.busy || state.cancelling || state.opening;
+  $('btn-cancel-open').disabled =
+    state.busy || state.cancelling || state.retracting || state.opening || !inProgress;
+  $('btn-refresh').disabled = state.busy || state.cancelling || state.retracting || state.opening;
   $('btn-cancel-confirm').disabled = state.cancelling;
   $('btn-cancel-back').disabled = state.cancelling;
-  $('btn-switch').disabled = state.busy || state.cancelling || state.opening;
-  $('btn-open').disabled = state.busy || state.opening;
-  $('btn-new').disabled = state.busy || state.opening;
-  $('workorder-input').disabled = state.busy || state.opening;
+  $('btn-switch').disabled = state.busy || state.cancelling || state.retracting || state.opening;
+  $('btn-open').disabled = state.busy || state.retracting || state.opening;
+  $('btn-new').disabled = state.busy || state.retracting || state.opening;
+  $('workorder-input').disabled = state.busy || state.retracting || state.opening;
   document.querySelectorAll('input[name="unit"]').forEach((radio) => {
-    radio.disabled = state.busy || state.cancelling || state.opening || !inProgress;
+    radio.disabled =
+      state.busy || state.cancelling || state.retracting || state.opening || !inProgress;
   });
+
+  // 撤回审计表：存在撤回记录即展示（进行中与完成后均保留痕迹，刷新后仍可见）
+  const retractions = Array.isArray(view?.retractions) ? view.retractions : [];
+  $('retractions-audit').hidden = !(view && retractions.length > 0);
+  if (view && retractions.length > 0) {
+    const tbody = $('retraction-table').querySelector('tbody');
+    tbody.textContent = '';
+    for (const r of retractions) {
+      const tr = document.createElement('tr');
+      const cells = [
+        r.sequence,
+        r.confirmation.position,
+        `${r.confirmation.torque} cN·m（原录入 ${r.confirmation.torque_input} ${r.confirmation.torque_unit}）`,
+        new Date(r.confirmation.confirmed_at).toLocaleString('zh-CN', { hour12: false }),
+        new Date(r.retracted_at).toLocaleString('zh-CN', { hour12: false }),
+      ];
+      for (const text of cells) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+  }
 }
 
 /** 启动时恢复：优先按本地工单码向服务端打开权威会话；无码则按旧方式读取会话。 */
@@ -563,6 +663,9 @@ window.addEventListener('DOMContentLoaded', () => {
   $('btn-cancel-open').addEventListener('click', () => setCancelForm(true));
   $('btn-cancel-back').addEventListener('click', () => setCancelForm(false));
   $('btn-cancel-confirm').addEventListener('click', cancelSession);
+  $('btn-retract-open').addEventListener('click', () => setRetractForm(true));
+  $('btn-retract-back').addEventListener('click', () => setRetractForm(false));
+  $('btn-retract-confirm').addEventListener('click', retractLast);
   $('cancel-reason').addEventListener('input', () => {
     const len = cancelReasonLength();
     $('cancel-reason-hint').textContent =
