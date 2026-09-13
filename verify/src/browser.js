@@ -337,6 +337,11 @@ export async function runBrowser(webBase, apiBase, t) {
       await page.click('#btn-submit');
       await page.waitForFunction(() => document.getElementById('error').textContent.includes('两位小数'));
       assertEqual(await currentPosition(page), 'A1', '精度提示后仍停留在 A1');
+      // 45.000 数值上等于 45.00，但仍是三位小数读数：页面同样当场拦截
+      await page.fill('#torque-input', '45.000');
+      await page.click('#btn-submit');
+      await page.waitForFunction(() => document.getElementById('error').textContent.includes('两位小数'));
+      assertEqual(await currentPosition(page), 'A1', '45.000 提示后仍停留在 A1');
       const st1 = await serverState(page);
       assertEqual(st1.confirmations.length, 0, '精度超限不写事件');
       // 修正为合格 N·m 后可继续

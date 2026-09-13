@@ -7,7 +7,7 @@
  *
  * 换算不能用浮点：41.99 * 100 在 JS 中为 4198.9999…。因此直接对 JSON 数字
  * 的原文（十进制字符串）用 BigInt 精确处理，能够可靠识别：
- * - 小数位超过两位（精度超限，如 45.123）；
+ * - 小数位超过两位（精度超限，如 45.123、45.000——尾随零也占一位）；
  * - 数值超出安全整数范围（无法精确换算）。
  */
 
@@ -75,7 +75,8 @@ export function readTorqueToken(rawBody) {
  * 把 N·m 读数的十进制文本精确换算为整数 cN·m。
  * @param {string} token JSON 数字原文，如 "45"、"42.00"、"4.45e1"
  * @returns {{ok:true, cnm:number}|{ok:false, reason:'precision'|'unconvertible'}}
- *   precision：归一化后小数位超过两位；unconvertible：记号非法或结果超出安全整数
+ *   precision：读数的十进制表示超过两位小数（末位为 0 也算，如 45.000）；
+ *   unconvertible：记号非法或结果超出安全整数
  */
 export function convertNmToCnm(token) {
   const m = DECIMAL_RE.exec(token);
@@ -89,17 +90,10 @@ export function convertNmToCnm(token) {
   if (negative) coeff = -coeff;
 
   // 读数 = coeff / 10^scale（已计入指数）
-  let scale = frac.length - exp;
-  if (coeff === 0n) {
-    scale = 0;
-  } else if (scale > 0) {
-    // 去掉末尾多余的 0：45.100 与 45.1 等价
-    while (scale > 0 && coeff % 10n === 0n) {
-      coeff /= 10n;
-      scale -= 1;
-    }
-  }
+  const scale = frac.length - exp;
 
+  // 精度按读数的十进制表示判定：超过两位小数即拒绝。
+  // 不得先剥尾随零——45.000 仍是三位小数的读数，必须判精度超限。
   if (scale > NM_MAX_DECIMALS) {
     return { ok: false, reason: 'precision' };
   }

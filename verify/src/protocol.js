@@ -175,7 +175,7 @@ export async function runProtocol(base, t) {
     assertEqual(st.expected_sequence, 1, '拒绝不推进序号');
   });
 
-  await t.test('N·m 精度超限（45.123）与无法精确换算（超大数）：422 且不推进', async () => {
+  await t.test('N·m 精度超限（45.123 / 45.000，尾随零也占精度）与无法精确换算（超大数）：422 且不推进', async () => {
     const s = await createSession(base);
     const precision = await postConfRaw(
       base,
@@ -184,6 +184,19 @@ export async function runProtocol(base, t) {
     );
     assertEqual(precision.status, 422, '精度超限状态码');
     assertEqual(precision.body.error.code, 'torque_precision_exceeded', '精度错误码');
+    // 45.000 数值上等于 45.00，但读数本身是三位小数，必须按精度超限拒绝
+    const trailingZeros = await postConfRaw(
+      base,
+      s.session_id,
+      '"sequence":1,"position":"A1","torque":45.000,"unit":"N·m","idempotency_key":' + JSON.stringify(key('preczero')),
+    );
+    assertEqual(trailingZeros.status, 422, '45.000 应判精度超限');
+    assertEqual(trailingZeros.body.error.code, 'torque_precision_exceeded', '45.000 精度错误码');
+    const trailingZerosStr = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: '45.000', unit: 'N·m', idempotency_key: key('preczerostr'),
+    });
+    assertEqual(trailingZerosStr.status, 422, '文本形式 45.000 同样判精度超限');
+    assertEqual(trailingZerosStr.body.error.code, 'torque_precision_exceeded', '文本 45.000 精度错误码');
     const huge = await postConfRaw(
       base,
       s.session_id,
